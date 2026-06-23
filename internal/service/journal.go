@@ -139,9 +139,11 @@ type ResumeInput struct {
 	Task    string
 }
 
-// Resume returns the most recent checkpoint for the requested project/task,
-// or nil if there is none. When both fields are empty it resumes the
-// current focus.
+// Resume returns the best entry to reconstruct context for the requested
+// project/task: the most recent checkpoint if one exists, otherwise the most
+// recent entry of any type (a log, interrupt, etc.). It returns nil only when
+// the project/task has no entries at all. When both fields are empty it
+// resumes the current focus.
 func (s *Service) Resume(ctx context.Context, in ResumeInput) (*types.Entry, error) {
 	project, task := in.Project, in.Task
 	if project == "" && task == "" {
@@ -155,12 +157,21 @@ func (s *Service) Resume(ctx context.Context, in ResumeInput) (*types.Entry, err
 		project, task = focus.Project, focus.Task
 	}
 
-	entries, err := s.store.ListEntries(ctx, types.EntryFilter{
-		Project: project,
-		Task:    task,
-		Types:   []types.EntryType{types.EntryTypeCheckpoint},
-		Limit:   1,
-	})
+	base := types.EntryFilter{Project: project, Task: task, Limit: 1}
+
+	// Prefer the most recent checkpoint.
+	checkpointFilter := base
+	checkpointFilter.Types = []types.EntryType{types.EntryTypeCheckpoint}
+	entries, err := s.store.ListEntries(ctx, checkpointFilter)
+	if err != nil {
+		return nil, fmt.Errorf("resume: %w", err)
+	}
+	if len(entries) > 0 {
+		return &entries[0], nil
+	}
+
+	// Fall back to the most recent entry of any type.
+	entries, err = s.store.ListEntries(ctx, base)
 	if err != nil {
 		return nil, fmt.Errorf("resume: %w", err)
 	}

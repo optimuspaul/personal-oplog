@@ -218,14 +218,56 @@ func TestResumeReturnsMostRecentCheckpoint(t *testing.T) {
 	}
 }
 
-func TestResumeNoCheckpointReturnsNil(t *testing.T) {
+func TestResumeNoEntriesReturnsNil(t *testing.T) {
 	svc, _ := newTestService(t)
 	got, err := svc.Resume(context.Background(), service.ResumeInput{Project: "DERS"})
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
 	if got != nil {
-		t.Errorf("expected nil, got %+v", got)
+		t.Errorf("expected nil for a project with no entries, got %+v", got)
+	}
+}
+
+func TestResumeFallsBackToLastEntryWhenNoCheckpoint(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	// Activity but no checkpoint: start, log, interrupt.
+	mustStart(t, svc, service.StartWorkInput{Project: "DERS", Task: "OAuth"})
+	mustLog(t, svc, service.LogInput{Text: "investigated scopes"})
+	if _, err := svc.Interrupt(ctx, service.InterruptInput{Reason: "prod issue"}); err != nil {
+		t.Fatalf("Interrupt: %v", err)
+	}
+
+	got, err := svc.Resume(ctx, service.ResumeInput{Project: "DERS"})
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected fallback to the last entry, got nil")
+	}
+	// The interrupt is the most recent entry.
+	if got.Type != types.EntryTypeInterrupt || got.Summary != "prod issue" {
+		t.Errorf("expected the interrupt entry, got %+v", got)
+	}
+}
+
+func TestResumePrefersCheckpointOverLaterEntries(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	mustStart(t, svc, service.StartWorkInput{Project: "DERS", Task: "OAuth"})
+	mustCheckpoint(t, svc, service.CheckpointInput{Summary: "the checkpoint"})
+	mustLog(t, svc, service.LogInput{Text: "a later log"})
+
+	got, err := svc.Resume(ctx, service.ResumeInput{Project: "DERS"})
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	// Even though the log is newer, the checkpoint wins.
+	if got == nil || got.Type != types.EntryTypeCheckpoint || got.Summary != "the checkpoint" {
+		t.Errorf("expected the checkpoint, got %+v", got)
 	}
 }
 

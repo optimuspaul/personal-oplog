@@ -279,8 +279,21 @@ func formatResume(e types.Entry) string {
 	b.WriteString("You were working on:\n\n")
 	fmt.Fprintf(&b, "Project: %s\n", e.Project)
 	fmt.Fprintf(&b, "Task: %s\n", e.Task)
+
+	if e.Type != types.EntryTypeCheckpoint {
+		// No checkpoint existed; this is the most recent entry of another type.
+		fmt.Fprintf(&b, "\n(No checkpoint saved — showing the last activity: %s)\n", e.Type)
+	}
+
 	if e.Summary != "" {
-		fmt.Fprintf(&b, "\nKnown state:\n%s\n", e.Summary)
+		label := "Known state"
+		switch e.Type {
+		case types.EntryTypeInterrupt:
+			label = "Interrupted because"
+		case types.EntryTypeLog:
+			label = "Last note"
+		}
+		fmt.Fprintf(&b, "\n%s:\n%s\n", label, e.Summary)
 	}
 	if e.NextAction != "" {
 		fmt.Fprintf(&b, "\nNext action:\n%s\n", e.NextAction)

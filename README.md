@@ -133,7 +133,7 @@ take effect after restarting it (or reopening its command palette).
 | `oplog_log`           | Record a free-form note. Project/task default to the focus.       |
 | `oplog_checkpoint`    | Capture resumable context: state, next action, open questions.    |
 | `oplog_interrupt`     | Mark the current task interrupted and clear the focus.            |
-| `oplog_resume`        | Retrieve the most recent checkpoint for a project/task.           |
+| `oplog_resume`        | Most recent checkpoint for a project/task; falls back to the last entry of any type if there's no checkpoint. |
 | `oplog_current_focus` | Return the task currently in progress, if any.                    |
 | `oplog_search`        | Search entries by project, task, tags, text, or type.            |
 | `oplog_recent`        | Return the most recent N entries (optionally one type).           |

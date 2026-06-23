@@ -7,10 +7,10 @@ Call the `oplog_checkpoint` MCP tool to capture resumable context.
 
 Resolve arguments from: $ARGUMENTS
 - Everything before a "next:" marker is the `summary`; everything after it is the `next_action`.
-- If there is no "next:" marker, use all of it as `summary` and leave `next_action` empty.
+- If there is no "next:" marker, use all of it as `summary`.
 - Leave `project` and `task` empty so the server uses the current focus.
 
-If $ARGUMENTS is empty, write a concise `summary` of what we just did in this
-conversation and set `next_action` to the obvious next step.
-
-Call the tool, then confirm in one line. Do nothing else.
+If $ARGUMENTS is empty, ask the user: "What's the current state, and what's the
+next action?" — then wait for their reply and use it. Do not summarize the
+conversation yourself. Once you have the details, call the tool and confirm in
+one line. Do nothing else.

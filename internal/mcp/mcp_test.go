@@ -166,6 +166,32 @@ func TestCheckpointAndResumeRoundTrip(t *testing.T) {
 	}
 }
 
+func TestResumeFallsBackToLastEntry(t *testing.T) {
+	s := newClient(t)
+	call(t, s, "oplog_start_work", map[string]any{"project": "DERS", "task": "OAuth"})
+	call(t, s, "oplog_log", map[string]any{"text": "investigated scopes"})
+	call(t, s, "oplog_interrupt", map[string]any{"reason": "prod issue"})
+
+	// No checkpoint exists; resume should fall back to the interrupt.
+	res := call(t, s, "oplog_resume", map[string]any{"project": "DERS"})
+	if res.IsError {
+		t.Fatalf("resume error: %s", resultText(res))
+	}
+	var out struct {
+		Found          bool   `json:"found"`
+		FromCheckpoint bool   `json:"from_checkpoint"`
+		Type           string `json:"type"`
+		Summary        string `json:"summary"`
+	}
+	decodeStructured(t, res, &out)
+	if !out.Found || out.FromCheckpoint || out.Type != "interrupt" || out.Summary != "prod issue" {
+		t.Errorf("expected fallback to interrupt entry, got %+v", out)
+	}
+	if !strings.Contains(resultText(res), "last activity") {
+		t.Errorf("expected fallback note in text, got: %q", resultText(res))
+	}
+}
+
 func TestResumeNoCheckpoint(t *testing.T) {
 	s := newClient(t)
 	res := call(t, s, "oplog_resume", map[string]any{"project": "NOPE"})

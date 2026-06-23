@@ -61,24 +61,30 @@ func newFocusOutput(f *types.Focus) focusOutput {
 // resumeOutput is the structured result of a resume. Found reports whether
 // a checkpoint existed; the remaining fields describe it when it did.
 type resumeOutput struct {
-	Found         bool     `json:"found"`
-	Project       string   `json:"project,omitempty"`
-	Task          string   `json:"task,omitempty"`
-	Summary       string   `json:"summary,omitempty"`
-	NextAction    string   `json:"next_action,omitempty"`
-	OpenQuestions []string `json:"open_questions,omitempty"`
-	Timestamp     string   `json:"timestamp,omitempty"`
+	Found bool `json:"found"`
+	// FromCheckpoint reports whether the resumed entry is a checkpoint; when
+	// false, this is a fallback to the most recent entry of another type.
+	FromCheckpoint bool     `json:"from_checkpoint"`
+	Type           string   `json:"type,omitempty"`
+	Project        string   `json:"project,omitempty"`
+	Task           string   `json:"task,omitempty"`
+	Summary        string   `json:"summary,omitempty"`
+	NextAction     string   `json:"next_action,omitempty"`
+	OpenQuestions  []string `json:"open_questions,omitempty"`
+	Timestamp      string   `json:"timestamp,omitempty"`
 }
 
 func newResumeOutput(e types.Entry) resumeOutput {
 	return resumeOutput{
-		Found:         true,
-		Project:       e.Project,
-		Task:          e.Task,
-		Summary:       e.Summary,
-		NextAction:    e.NextAction,
-		OpenQuestions: e.OpenQuestions,
-		Timestamp:     formatTime(e.Timestamp),
+		Found:          true,
+		FromCheckpoint: e.Type == types.EntryTypeCheckpoint,
+		Type:           string(e.Type),
+		Project:        e.Project,
+		Task:           e.Task,
+		Summary:        e.Summary,
+		NextAction:     e.NextAction,
+		OpenQuestions:  e.OpenQuestions,
+		Timestamp:      formatTime(e.Timestamp),
 	}
 }
 
