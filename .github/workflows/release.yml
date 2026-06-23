@@ -1,0 +1,25 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
+  build:
+    needs: test
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ github.ref_name }}
+      package: true
+
+  publish:
+    needs: build
+    permissions:
+      contents: write
+    uses: ./.github/workflows/publish.yml
+    with:
+      # The tag already exists (this run was triggered by its push).
+      tag: ${{ github.ref_name }}

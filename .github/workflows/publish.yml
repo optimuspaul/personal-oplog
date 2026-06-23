@@ -1,0 +1,46 @@
+name: Publish
+
+# Reusable: collects build artifacts and publishes a GitHub release.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.2.3)."
+        type: string
+        required: true
+      target:
+        description: "Commit-ish to create the tag at, if it does not exist yet."
+        type: string
+        default: ""
+
+jobs:
+  publish:
+    name: Publish release
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to create the tag, release, and upload assets.
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Inputs come from trusted caller workflows; pass via env and quote.
+          TAG: ${{ inputs.tag }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          flags=(--repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes)
+          if [ -n "$TARGET" ]; then
+            flags+=(--target "$TARGET")
+          fi
+          gh release create "$TAG" dist/* "${flags[@]}"

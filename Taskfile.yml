@@ -1,0 +1,98 @@
+version: "3"
+
+vars:
+  BINARY: poplog-local-mcp
+  PKG: ./cmd/poplog-local-mcp
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo dev
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  build:
+    desc: Build the poplog-local-mcp binary into ./bin
+    cmds:
+      - go build -ldflags "-X main.version={{.VERSION}}" -o bin/{{.BINARY}} {{.PKG}}
+
+  run:
+    desc: Run the MCP server over stdio (Ctrl-C to stop)
+    cmds:
+      - go run {{.PKG}} {{.CLI_ARGS}}
+
+  go:test:
+    desc: Run the test suite with the race detector
+    cmds:
+      - go test -race ./...
+
+  go:test:pretty:
+    desc: Run tests with readable output (uses gotestsum if installed)
+    cmds:
+      - |
+        if command -v gotestsum >/dev/null 2>&1; then
+          gotestsum --format testname -- -race ./...
+        else
+          go test -race -v ./...
+        fi
+
+  go:test:ci:
+    desc: Run tests with coverage and machine-readable output for CI
+    cmds:
+      - mkdir -p dist
+      - go test -race -covermode=atomic -coverprofile=dist/coverage.out ./...
+      - go tool cover -func=dist/coverage.out | tail -1
+
+  cover:
+    desc: Generate and open an HTML coverage report
+    deps: [go:test:ci]
+    cmds:
+      - go tool cover -html=dist/coverage.out -o dist/coverage.html
+      - echo "Coverage report written to dist/coverage.html"
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  fmt:
+    desc: Format all Go source
+    cmds:
+      - gofmt -w .
+
+  fmt:check:
+    desc: Fail if any Go source is not formatted
+    cmds:
+      - test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+  lint:
+    desc: Run golangci-lint if installed, otherwise vet + fmt check
+    cmds:
+      - |
+        if command -v golangci-lint >/dev/null 2>&1; then
+          golangci-lint run ./...
+        else
+          echo "golangci-lint not found; running go vet + gofmt check"
+          go vet ./...
+          test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+        fi
+
+  tidy:
+    desc: Tidy and verify go modules
+    cmds:
+      - go mod tidy
+      - go mod verify
+
+  check:
+    desc: Run the full pre-commit gate (fmt check, vet, tests)
+    cmds:
+      - task: fmt:check
+      - task: vet
+      - task: go:test
+
+  clean:
+    desc: Remove build and coverage artifacts
+    cmds:
+      - rm -rf bin dist
