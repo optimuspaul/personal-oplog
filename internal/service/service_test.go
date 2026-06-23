@@ -316,6 +316,53 @@ func TestEndWorkWithoutFocusErrors(t *testing.T) {
 	}
 }
 
+func TestRecentReturnsNewestFirstWithDefaultLimit(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	// 12 entries; default limit is 10.
+	for i := range 12 {
+		mustLog(t, svc, service.LogInput{Project: "DERS", Task: "OAuth", Text: fmt.Sprintf("note %02d", i)})
+	}
+
+	got, err := svc.Recent(ctx, service.RecentInput{})
+	if err != nil {
+		t.Fatalf("Recent: %v", err)
+	}
+	if len(got) != service.DefaultRecentLimit {
+		t.Fatalf("got %d entries, want default %d", len(got), service.DefaultRecentLimit)
+	}
+	// Newest first: the last-written note ("note 11") must be first.
+	if got[0].Summary != "note 11" {
+		t.Errorf("first entry = %q, want %q (newest first)", got[0].Summary, "note 11")
+	}
+}
+
+func TestRecentRespectsLimitAndType(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	mustStart(t, svc, service.StartWorkInput{Project: "DERS", Task: "OAuth"})
+	mustLog(t, svc, service.LogInput{Text: "a log"})
+	mustCheckpoint(t, svc, service.CheckpointInput{Summary: "a checkpoint"})
+
+	got, err := svc.Recent(ctx, service.RecentInput{Limit: 1})
+	if err != nil {
+		t.Fatalf("Recent: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("limit=1 returned %d entries", len(got))
+	}
+
+	got, err = svc.Recent(ctx, service.RecentInput{Limit: 5, Type: types.EntryTypeCheckpoint})
+	if err != nil {
+		t.Fatalf("Recent (typed): %v", err)
+	}
+	if len(got) != 1 || got[0].Type != types.EntryTypeCheckpoint {
+		t.Errorf("type filter failed: %+v", got)
+	}
+}
+
 func TestSearchDelegatesFilter(t *testing.T) {
 	svc, _ := newTestService(t)
 	ctx := context.Background()

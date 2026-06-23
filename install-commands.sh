@@ -21,6 +21,10 @@
 #                   Codex has no project scope; it always uses ~/.codex/prompts.
 #   -h, --help      Show this help.
 #
+# Re-exec under bash if started by another shell (e.g. `zsh install-commands.sh`).
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
 set -euo pipefail
 
 CLIENT="all"
@@ -55,10 +59,11 @@ done
 [ -n "$SRC" ] || SRC="$SCRIPT_DIR/commands"
 [ -d "$SRC" ] || err "source command directory not found: $SRC"
 
-shopt -s nullglob
-FILES=("$SRC"/*.md)
-shopt -u nullglob
-[ ${#FILES[@]} -gt 0 ] || err "no .md command files found in $SRC"
+FILES=()
+while IFS= read -r f; do
+  FILES+=("$f")
+done < <(find "$SRC" -maxdepth 1 -type f -name '*.md' | sort)
+[ "${#FILES[@]}" -gt 0 ] || err "no .md command files found in $SRC"
 
 # strip_frontmatter removes a leading '---' YAML block and the blank lines
 # immediately after it, passing everything else through unchanged. Files with

@@ -100,6 +100,38 @@ func (s *Service) Search(ctx context.Context, filter types.EntryFilter) ([]types
 	return entries, nil
 }
 
+// DefaultRecentLimit is the number of entries Recent returns when no positive
+// limit is supplied.
+const DefaultRecentLimit = 10
+
+// RecentInput selects the most recent entries to return.
+type RecentInput struct {
+	// Limit caps the number of entries; values <= 0 use DefaultRecentLimit.
+	Limit int
+	// Type, when set, restricts results to that entry type.
+	Type types.EntryType
+}
+
+// Recent returns the most recent entries, newest first, optionally limited to
+// a single entry type. It is a purpose-built shortcut over Search for the
+// common "show me the last N" case.
+func (s *Service) Recent(ctx context.Context, in RecentInput) ([]types.Entry, error) {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = DefaultRecentLimit
+	}
+	filter := types.EntryFilter{Limit: limit}
+	if in.Type != "" {
+		filter.Types = []types.EntryType{in.Type}
+	}
+
+	entries, err := s.store.ListEntries(ctx, filter)
+	if err != nil {
+		return nil, fmt.Errorf("recent: %w", err)
+	}
+	return entries, nil
+}
+
 // ResumeInput selects the context to resume. At least one of Project or
 // Task must be set; empty fields fall back to the current focus.
 type ResumeInput struct {

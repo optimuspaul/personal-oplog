@@ -50,6 +50,11 @@ func registerTools(server *mcpsdk.Server, svc *service.Service) {
 	}, searchHandler(svc))
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:        "oplog_recent",
+		Description: "Return the most recent N journal entries, newest first, optionally limited to one entry type.",
+	}, recentHandler(svc))
+
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        "oplog_end_work",
 		Description: "Mark the current session complete, recording a summary and clearing the active focus.",
 	}, endWorkHandler(svc))
@@ -218,6 +223,28 @@ func searchHandler(svc *service.Service) mcpsdk.ToolHandlerFor[searchInput, sear
 		}
 		out := newSearchOutput(entries)
 		text := fmt.Sprintf("Found %d matching %s.", out.Count, plural(out.Count, "entry", "entries"))
+		return textResult(text), out, nil
+	}
+}
+
+// --- recent ---
+
+type recentInput struct {
+	Limit int    `json:"limit,omitempty" jsonschema:"number of entries to return (default 10)"`
+	Type  string `json:"type,omitempty" jsonschema:"optional entry type filter: log, checkpoint, interrupt, start_work, end_work"`
+}
+
+func recentHandler(svc *service.Service) mcpsdk.ToolHandlerFor[recentInput, searchOutput] {
+	return func(ctx context.Context, _ *mcpsdk.CallToolRequest, in recentInput) (*mcpsdk.CallToolResult, searchOutput, error) {
+		entries, err := svc.Recent(ctx, service.RecentInput{
+			Limit: in.Limit,
+			Type:  types.EntryType(in.Type),
+		})
+		if err != nil {
+			return nil, searchOutput{}, err
+		}
+		out := newSearchOutput(entries)
+		text := fmt.Sprintf("%d most recent %s.", out.Count, plural(out.Count, "entry", "entries"))
 		return textResult(text), out, nil
 	}
 }

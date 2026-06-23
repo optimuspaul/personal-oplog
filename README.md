@@ -136,6 +136,7 @@ take effect after restarting it (or reopening its command palette).
 | `oplog_resume`        | Retrieve the most recent checkpoint for a project/task.           |
 | `oplog_current_focus` | Return the task currently in progress, if any.                    |
 | `oplog_search`        | Search entries by project, task, tags, text, or type.            |
+| `oplog_recent`        | Return the most recent N entries (optionally one type).           |
 | `oplog_end_work`      | Mark the session complete and clear the focus.                    |
 
 > Tool names use underscores rather than dots (`oplog_start_work`, not

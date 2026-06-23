@@ -244,6 +244,41 @@ func TestSearchTool(t *testing.T) {
 	}
 }
 
+func TestRecentTool(t *testing.T) {
+	s := newClient(t)
+	call(t, s, "oplog_start_work", map[string]any{"project": "DERS", "task": "OAuth"})
+	call(t, s, "oplog_log", map[string]any{"text": "first"})
+	call(t, s, "oplog_checkpoint", map[string]any{"summary": "second"})
+	call(t, s, "oplog_log", map[string]any{"text": "third"})
+
+	// limit=2 → the two newest entries, newest first.
+	res := call(t, s, "oplog_recent", map[string]any{"limit": 2})
+	if res.IsError {
+		t.Fatalf("recent error: %s", resultText(res))
+	}
+	var out struct {
+		Count   int `json:"count"`
+		Entries []struct {
+			Type    string `json:"type"`
+			Summary string `json:"summary"`
+		} `json:"entries"`
+	}
+	decodeStructured(t, res, &out)
+	if out.Count != 2 || len(out.Entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", out.Count)
+	}
+	if out.Entries[0].Summary != "third" {
+		t.Errorf("newest entry = %q, want %q", out.Entries[0].Summary, "third")
+	}
+
+	// type filter restricts to checkpoints.
+	res = call(t, s, "oplog_recent", map[string]any{"limit": 10, "type": "checkpoint"})
+	decodeStructured(t, res, &out)
+	if out.Count != 1 || out.Entries[0].Type != "checkpoint" {
+		t.Errorf("type filter failed: %+v", out)
+	}
+}
+
 func TestInterruptClearsFocus(t *testing.T) {
 	s := newClient(t)
 	call(t, s, "oplog_start_work", map[string]any{"project": "DERS", "task": "OAuth"})
