@@ -1,14 +1,13 @@
 // Package jsonl implements the persistence.Store interface on top of a
-// local directory of JSON Lines files, the default local-first backend.
+// local JSON Lines file, the default local-first backend.
 //
 // Layout (rooted at the directory passed to NewStore):
 //
 //	<dir>/
-//	├── log.jsonl          append-only journal entries, one JSON object per line
-//	├── current_focus.json the active focus, or absent when no task is active
-//	├── projects/
-//	├── sessions/
-//	└── backups/
+//	└── events.jsonl   append-only event log, one JSON object per line
+//
+// There is no separate focus or state file: the journal is the single source
+// of truth, and all derived views are computed from it.
 package jsonl
 
 import (
@@ -29,17 +28,15 @@ import (
 )
 
 const (
-	logFileName   = "log.jsonl"
-	focusFileName = "current_focus.json"
+	eventsFileName = "events.jsonl"
 
-	// maxLineBytes bounds the size of a single journal entry when scanning.
+	// maxLineBytes bounds the size of a single event when scanning.
 	maxLineBytes = 4 * 1024 * 1024
 )
 
-// Store persists the journal as JSON Lines files under a directory.
+// Store persists the journal as a JSON Lines file under a directory.
 //
-// A mutex serializes writes and protects the focus file against torn reads;
-// reads of the append-only log are line-oriented and tolerate concurrent
+// A mutex serializes appends; reads are line-oriented and tolerate concurrent
 // appends.
 type Store struct {
 	dir string
@@ -51,63 +48,60 @@ var _ persistence.Store = (*Store)(nil)
 
 // NewStore opens (creating if necessary) a JSONL store rooted at dir.
 func NewStore(dir string) (*Store, error) {
-	for _, sub := range []string{"", "projects", "sessions", "backups"} {
-		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
-			return nil, fmt.Errorf("create %q: %w", filepath.Join(dir, sub), err)
-		}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("create %q: %w", dir, err)
 	}
 	return &Store{dir: dir}, nil
 }
 
-func (s *Store) logPath() string   { return filepath.Join(s.dir, logFileName) }
-func (s *Store) focusPath() string { return filepath.Join(s.dir, focusFileName) }
+func (s *Store) eventsPath() string { return filepath.Join(s.dir, eventsFileName) }
 
-// AppendEntry durably appends a single entry to the journal.
-func (s *Store) AppendEntry(ctx context.Context, entry types.Entry) error {
+// AppendEvent durably appends a single event to the journal.
+func (s *Store) AppendEvent(ctx context.Context, event types.Event) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	line, err := json.Marshal(entry)
+	line, err := json.Marshal(event)
 	if err != nil {
-		return fmt.Errorf("marshal entry: %w", err)
+		return fmt.Errorf("marshal event: %w", err)
 	}
 	line = append(line, '\n')
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	f, err := os.OpenFile(s.logPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(s.eventsPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		return fmt.Errorf("open log: %w", err)
+		return fmt.Errorf("open events log: %w", err)
 	}
 	defer f.Close()
 
 	if _, err := f.Write(line); err != nil {
-		return fmt.Errorf("write entry: %w", err)
+		return fmt.Errorf("write event: %w", err)
 	}
 	if err := f.Sync(); err != nil {
-		return fmt.Errorf("sync log: %w", err)
+		return fmt.Errorf("sync events log: %w", err)
 	}
 	return nil
 }
 
-// ListEntries returns entries matching the filter, most recent first.
-func (s *Store) ListEntries(ctx context.Context, filter types.EntryFilter) ([]types.Entry, error) {
+// ListEvents returns events matching the filter, most recent first.
+func (s *Store) ListEvents(ctx context.Context, filter types.EventFilter) ([]types.Event, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	f, err := os.Open(s.logPath())
+	f, err := os.Open(s.eventsPath())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("open log: %w", err)
+		return nil, fmt.Errorf("open events log: %w", err)
 	}
 	defer f.Close()
 
-	var matches []types.Entry
+	var matches []types.Event
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
 	for scanner.Scan() {
@@ -115,16 +109,16 @@ func (s *Store) ListEntries(ctx context.Context, filter types.EntryFilter) ([]ty
 		if len(strings.TrimSpace(string(raw))) == 0 {
 			continue
 		}
-		var entry types.Entry
-		if err := json.Unmarshal(raw, &entry); err != nil {
-			return nil, fmt.Errorf("parse log entry: %w", err)
+		var event types.Event
+		if err := json.Unmarshal(raw, &event); err != nil {
+			return nil, fmt.Errorf("parse event: %w", err)
 		}
-		if matchesFilter(entry, filter) {
-			matches = append(matches, entry)
+		if matchesFilter(event, filter) {
+			matches = append(matches, event)
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read log: %w", err)
+		return nil, fmt.Errorf("read events log: %w", err)
 	}
 
 	sort.SliceStable(matches, func(i, j int) bool {
@@ -137,122 +131,37 @@ func (s *Store) ListEntries(ctx context.Context, filter types.EntryFilter) ([]ty
 	return matches, nil
 }
 
-// GetCurrentFocus returns the active focus, or nil if no task is active.
-func (s *Store) GetCurrentFocus(ctx context.Context) (*types.Focus, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	data, err := os.ReadFile(s.focusPath())
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("read focus: %w", err)
-	}
-
-	var focus types.Focus
-	if err := json.Unmarshal(data, &focus); err != nil {
-		return nil, fmt.Errorf("parse focus: %w", err)
-	}
-	return &focus, nil
-}
-
-// SetCurrentFocus replaces the active focus.
-func (s *Store) SetCurrentFocus(ctx context.Context, focus types.Focus) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	data, err := json.MarshalIndent(focus, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal focus: %w", err)
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.writeAtomic(s.focusPath(), data)
-}
-
-// ClearCurrentFocus removes the active focus, leaving no task active.
-func (s *Store) ClearCurrentFocus(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if err := os.Remove(s.focusPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("clear focus: %w", err)
-	}
-	return nil
-}
-
-// writeAtomic writes data to path via a temp file and rename, so readers
-// never observe a partially written file.
-func (s *Store) writeAtomic(path string, data []byte) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
-	if err != nil {
-		return fmt.Errorf("create temp: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write temp: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return fmt.Errorf("sync temp: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp: %w", err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("rename temp: %w", err)
-	}
-	return nil
-}
-
-// matchesFilter reports whether entry satisfies every set constraint in
+// matchesFilter reports whether event satisfies every set constraint in
 // filter. Zero-valued fields impose no constraint.
-func matchesFilter(entry types.Entry, filter types.EntryFilter) bool {
-	if filter.Project != "" && entry.Project != filter.Project {
+func matchesFilter(event types.Event, filter types.EventFilter) bool {
+	if filter.TaskID != "" && event.TaskID != filter.TaskID {
 		return false
 	}
-	if filter.Task != "" && entry.Task != filter.Task {
-		return false
-	}
-	if len(filter.Types) > 0 && !slices.Contains(filter.Types, entry.Type) {
+	if len(filter.Types) > 0 && !slices.Contains(filter.Types, event.Type) {
 		return false
 	}
 	for _, tag := range filter.Tags {
-		if !slices.Contains(entry.Tags, tag) {
+		if !slices.Contains(event.Tags, tag) {
 			return false
 		}
 	}
-	if filter.Since != nil && entry.Timestamp.Before(*filter.Since) {
+	if filter.Since != nil && event.Timestamp.Before(*filter.Since) {
 		return false
 	}
-	if filter.Until != nil && entry.Timestamp.After(*filter.Until) {
+	if filter.Until != nil && event.Timestamp.After(*filter.Until) {
 		return false
 	}
-	if filter.Text != "" && !matchesText(entry, filter.Text) {
+	if filter.Text != "" && !matchesText(event, filter.Text) {
 		return false
 	}
 	return true
 }
 
-func matchesText(entry types.Entry, text string) bool {
+func matchesText(event types.Event, text string) bool {
 	needle := strings.ToLower(text)
-	fields := []string{entry.Project, entry.Task, entry.Summary, entry.NextAction}
-	fields = append(fields, entry.OpenQuestions...)
-	fields = append(fields, entry.Tags...)
+	fields := []string{event.Name, event.Project, event.Summary, event.Text, event.NextAction}
+	fields = append(fields, event.OpenQuestions...)
+	fields = append(fields, event.Tags...)
 	for _, field := range fields {
 		if strings.Contains(strings.ToLower(field), needle) {
 			return true

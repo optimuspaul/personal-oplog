@@ -29,8 +29,6 @@ func newClient(t *testing.T) *mcpsdk.ClientSession {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	// The server must be connected before the client; Run blocks for the
-	// lifetime of the connection, so it runs in the background.
 	go func() { _ = server.Run(ctx, serverT) }()
 
 	client := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "test-client", Version: "1"}, nil)
@@ -48,6 +46,9 @@ func call(t *testing.T, s *mcpsdk.ClientSession, name string, args map[string]an
 	if err != nil {
 		t.Fatalf("CallTool(%s): %v", name, err)
 	}
+	if res.IsError {
+		t.Fatalf("CallTool(%s) returned error: %s", name, resultText(res))
+	}
 	return res
 }
 
@@ -61,7 +62,6 @@ func resultText(res *mcpsdk.CallToolResult) string {
 	return sb.String()
 }
 
-// decodeStructured re-decodes the structured content into target.
 func decodeStructured(t *testing.T, res *mcpsdk.CallToolResult, target any) {
 	t.Helper()
 	if res.StructuredContent == nil {
@@ -76,7 +76,21 @@ func decodeStructured(t *testing.T, res *mcpsdk.CallToolResult, target any) {
 	}
 }
 
-func TestListToolsExposesAllEight(t *testing.T) {
+// startTask creates and starts a task, returning its id.
+func startTask(t *testing.T, s *mcpsdk.ClientSession, project, name string) string {
+	t.Helper()
+	res := call(t, s, "oplog_start", map[string]any{"project": project, "name": name})
+	var out struct {
+		ID string `json:"id"`
+	}
+	decodeStructured(t, res, &out)
+	if out.ID == "" {
+		t.Fatal("start returned no task id")
+	}
+	return out.ID
+}
+
+func TestListToolsExposesFullSurface(t *testing.T) {
 	s := newClient(t)
 	res, err := s.ListTools(context.Background(), nil)
 	if err != nil {
@@ -84,14 +98,11 @@ func TestListToolsExposesAllEight(t *testing.T) {
 	}
 
 	want := map[string]bool{
-		"oplog_start_work":    false,
-		"oplog_log":           false,
-		"oplog_checkpoint":    false,
-		"oplog_interrupt":     false,
-		"oplog_resume":        false,
-		"oplog_current_focus": false,
-		"oplog_search":        false,
-		"oplog_end_work":      false,
+		"oplog_start": false, "oplog_park": false, "oplog_complete": false,
+		"oplog_abandon": false, "oplog_checkpoint": false, "oplog_note": false,
+		"oplog_link": false, "oplog_focus": false, "oplog_tasks": false,
+		"oplog_projects": false, "oplog_threads": false, "oplog_context": false,
+		"oplog_recent": false, "oplog_search": false,
 	}
 	for _, tool := range res.Tools {
 		if _, ok := want[tool.Name]; ok {
@@ -105,248 +116,168 @@ func TestListToolsExposesAllEight(t *testing.T) {
 	}
 }
 
-func TestStartWorkTool(t *testing.T) {
+func TestStartAndFocusLifecycle(t *testing.T) {
 	s := newClient(t)
-	res := call(t, s, "oplog_start_work", map[string]any{"project": "DERS", "task": "OAuth"})
-	if res.IsError {
-		t.Fatalf("unexpected error: %s", resultText(res))
+
+	// No focus initially.
+	res := call(t, s, "oplog_focus", map[string]any{})
+	var focus struct {
+		Active bool `json:"active"`
 	}
-	if !strings.Contains(resultText(res), "DERS") {
-		t.Errorf("text missing project: %q", resultText(res))
+	decodeStructured(t, res, &focus)
+	if focus.Active {
+		t.Error("expected no active focus initially")
 	}
 
-	var out struct {
-		Active  bool   `json:"active"`
-		Project string `json:"project"`
-		Task    string `json:"task"`
+	startTask(t, s, "DERS", "OAuth")
+
+	res = call(t, s, "oplog_focus", map[string]any{})
+	var focus2 struct {
+		Active bool `json:"active"`
+		Task   struct {
+			Name   string `json:"name"`
+			Status string `json:"status"`
+		} `json:"task"`
 	}
-	decodeStructured(t, res, &out)
-	if !out.Active || out.Project != "DERS" || out.Task != "OAuth" {
-		t.Errorf("unexpected focus output: %+v", out)
+	decodeStructured(t, res, &focus2)
+	if !focus2.Active || focus2.Task.Name != "OAuth" || focus2.Task.Status != "active" {
+		t.Errorf("unexpected focus: %+v", focus2)
 	}
 }
 
-func TestStartWorkMissingFieldIsError(t *testing.T) {
+func TestStartMissingFieldsIsError(t *testing.T) {
 	s := newClient(t)
 	res, err := s.CallTool(context.Background(),
-		&mcpsdk.CallToolParams{Name: "oplog_start_work", Arguments: map[string]any{"task": "OAuth"}})
-	// Missing required input is rejected — either as a protocol error or a
-	// tool error result; both are acceptable, a silent success is not.
+		&mcpsdk.CallToolParams{Name: "oplog_start", Arguments: map[string]any{"name": "OAuth"}})
 	if err == nil && !res.IsError {
-		t.Error("expected error for missing project")
+		t.Error("expected error when creating a task without a project")
 	}
 }
 
-func TestCheckpointAndResumeRoundTrip(t *testing.T) {
+func TestTasksFuzzyResolution(t *testing.T) {
 	s := newClient(t)
-	call(t, s, "oplog_start_work", map[string]any{"project": "DERS", "task": "OAuth"})
+	startTask(t, s, "ADS", "monkey task")
+	startTask(t, s, "OTHER", "banana split")
 
-	cp := call(t, s, "oplog_checkpoint", map[string]any{
+	res := call(t, s, "oplog_tasks", map[string]any{"query": "monkey"})
+	var out struct {
+		Count int `json:"count"`
+		Tasks []struct {
+			Project string `json:"project"`
+			Name    string `json:"name"`
+		} `json:"tasks"`
+	}
+	decodeStructured(t, res, &out)
+	if out.Count != 1 || out.Tasks[0].Project != "ADS" {
+		t.Errorf("fuzzy resolution failed: %+v", out)
+	}
+}
+
+func TestCheckpointAndContextRoundTrip(t *testing.T) {
+	s := newClient(t)
+	startTask(t, s, "DERS", "OAuth")
+
+	call(t, s, "oplog_checkpoint", map[string]any{
 		"summary":        "Password grant passes. Client credentials failing.",
 		"next_action":    "Inspect audience parameter.",
 		"open_questions": []string{"Is hey-api sending audience correctly?"},
 	})
-	if cp.IsError {
-		t.Fatalf("checkpoint error: %s", resultText(cp))
-	}
 
-	res := call(t, s, "oplog_resume", map[string]any{"project": "DERS"})
-	text := resultText(res)
-	if !strings.Contains(text, "Inspect audience parameter.") {
-		t.Errorf("resume text missing next action: %q", text)
+	res := call(t, s, "oplog_context", map[string]any{})
+	if !strings.Contains(resultText(res), "Inspect audience parameter.") {
+		t.Errorf("context text missing next action: %q", resultText(res))
 	}
-
 	var out struct {
-		Found      bool   `json:"found"`
-		NextAction string `json:"next_action"`
+		LatestCheckpoint struct {
+			NextAction string `json:"next_action"`
+		} `json:"latest_checkpoint"`
 	}
 	decodeStructured(t, res, &out)
-	if !out.Found || out.NextAction != "Inspect audience parameter." {
-		t.Errorf("unexpected resume output: %+v", out)
+	if out.LatestCheckpoint.NextAction != "Inspect audience parameter." {
+		t.Errorf("unexpected context output: %+v", out)
 	}
 }
 
-func TestResumeFallsBackToLastEntry(t *testing.T) {
+func TestParkSurfacesAsLooseThread(t *testing.T) {
 	s := newClient(t)
-	call(t, s, "oplog_start_work", map[string]any{"project": "DERS", "task": "OAuth"})
-	call(t, s, "oplog_log", map[string]any{"text": "investigated scopes"})
-	call(t, s, "oplog_interrupt", map[string]any{"reason": "prod issue"})
+	startTask(t, s, "ADS", "RPV query")
+	call(t, s, "oplog_park", map[string]any{"reason": "interrupted"})
 
-	// No checkpoint exists; resume should fall back to the interrupt.
-	res := call(t, s, "oplog_resume", map[string]any{"project": "DERS"})
-	if res.IsError {
-		t.Fatalf("resume error: %s", resultText(res))
-	}
+	res := call(t, s, "oplog_threads", map[string]any{})
 	var out struct {
-		Found          bool   `json:"found"`
-		FromCheckpoint bool   `json:"from_checkpoint"`
-		Type           string `json:"type"`
-		Summary        string `json:"summary"`
+		Count   int `json:"count"`
+		Threads []struct {
+			Task struct {
+				Name   string `json:"name"`
+				Status string `json:"status"`
+			} `json:"task"`
+		} `json:"threads"`
 	}
 	decodeStructured(t, res, &out)
-	if !out.Found || out.FromCheckpoint || out.Type != "interrupt" || out.Summary != "prod issue" {
-		t.Errorf("expected fallback to interrupt entry, got %+v", out)
-	}
-	if !strings.Contains(resultText(res), "last activity") {
-		t.Errorf("expected fallback note in text, got: %q", resultText(res))
+	if out.Count != 1 || out.Threads[0].Task.Name != "RPV query" || out.Threads[0].Task.Status != "parked" {
+		t.Errorf("expected RPV query as a parked loose thread, got %+v", out)
 	}
 }
 
-func TestResumeNoCheckpoint(t *testing.T) {
+func TestCompleteRemovesFromFocus(t *testing.T) {
 	s := newClient(t)
-	res := call(t, s, "oplog_resume", map[string]any{"project": "NOPE"})
-	if res.IsError {
-		t.Fatalf("unexpected error: %s", resultText(res))
-	}
-	var out struct {
-		Found bool `json:"found"`
-	}
-	decodeStructured(t, res, &out)
-	if out.Found {
-		t.Error("expected found=false")
-	}
-}
+	startTask(t, s, "DERS", "OAuth")
 
-func TestCurrentFocusLifecycle(t *testing.T) {
-	s := newClient(t)
+	call(t, s, "oplog_complete", map[string]any{"summary": "done"})
 
-	// No focus yet.
-	res := call(t, s, "oplog_current_focus", map[string]any{})
+	res := call(t, s, "oplog_focus", map[string]any{})
 	var out struct {
 		Active bool `json:"active"`
 	}
 	decodeStructured(t, res, &out)
 	if out.Active {
-		t.Error("expected no active focus initially")
-	}
-
-	call(t, s, "oplog_start_work", map[string]any{"project": "DERS", "task": "OAuth"})
-
-	res = call(t, s, "oplog_current_focus", map[string]any{})
-	decodeStructured(t, res, &out)
-	if !out.Active {
-		t.Error("expected active focus after start_work")
+		t.Error("expected no focus after completing the active task")
 	}
 }
 
-func TestLogFallsBackToFocus(t *testing.T) {
+func TestParkWithoutFocusIsError(t *testing.T) {
 	s := newClient(t)
-	call(t, s, "oplog_start_work", map[string]any{"project": "DERS", "task": "OAuth"})
-
-	res := call(t, s, "oplog_log", map[string]any{"text": "Investigated Auth0 scopes."})
-	if res.IsError {
-		t.Fatalf("log error: %s", resultText(res))
-	}
-	var out struct {
-		Project string `json:"project"`
-		Task    string `json:"task"`
-		Type    string `json:"type"`
-	}
-	decodeStructured(t, res, &out)
-	if out.Project != "DERS" || out.Task != "OAuth" || out.Type != "log" {
-		t.Errorf("log did not inherit focus: %+v", out)
+	res := call0(t, s, "oplog_park", map[string]any{"reason": "paused"})
+	if !res.IsError {
+		t.Error("expected tool error when parking with no active focus")
 	}
 }
 
-func TestSearchTool(t *testing.T) {
+func TestSearchAndRecent(t *testing.T) {
 	s := newClient(t)
-	call(t, s, "oplog_start_work", map[string]any{"project": "DERS", "task": "OAuth"})
+	startTask(t, s, "DERS", "OAuth")
 	call(t, s, "oplog_checkpoint", map[string]any{"summary": "keep me"})
-	call(t, s, "oplog_log", map[string]any{"text": "a note"})
+	call(t, s, "oplog_note", map[string]any{"text": "a note"})
 
 	res := call(t, s, "oplog_search", map[string]any{"type": "checkpoint"})
-	if res.IsError {
-		t.Fatalf("search error: %s", resultText(res))
-	}
-	var out struct {
-		Count   int `json:"count"`
-		Entries []struct {
+	var search struct {
+		Count  int `json:"count"`
+		Events []struct {
 			Summary string `json:"summary"`
-		} `json:"entries"`
+		} `json:"events"`
 	}
-	decodeStructured(t, res, &out)
-	if out.Count != 1 || len(out.Entries) != 1 || out.Entries[0].Summary != "keep me" {
-		t.Errorf("unexpected search output: %+v", out)
+	decodeStructured(t, res, &search)
+	if search.Count != 1 || search.Events[0].Summary != "keep me" {
+		t.Errorf("unexpected search output: %+v", search)
+	}
+
+	res = call(t, s, "oplog_recent", map[string]any{"limit": 2})
+	var recent struct {
+		Count int `json:"count"`
+	}
+	decodeStructured(t, res, &recent)
+	if recent.Count != 2 {
+		t.Errorf("expected 2 recent events, got %d", recent.Count)
 	}
 }
 
-func TestRecentTool(t *testing.T) {
-	s := newClient(t)
-	call(t, s, "oplog_start_work", map[string]any{"project": "DERS", "task": "OAuth"})
-	call(t, s, "oplog_log", map[string]any{"text": "first"})
-	call(t, s, "oplog_checkpoint", map[string]any{"summary": "second"})
-	call(t, s, "oplog_log", map[string]any{"text": "third"})
-
-	// limit=2 → the two newest entries, newest first.
-	res := call(t, s, "oplog_recent", map[string]any{"limit": 2})
-	if res.IsError {
-		t.Fatalf("recent error: %s", resultText(res))
+// call0 issues a tool call without failing the test on a tool error, for the
+// cases that assert on IsError.
+func call0(t *testing.T, s *mcpsdk.ClientSession, name string, args map[string]any) *mcpsdk.CallToolResult {
+	t.Helper()
+	res, err := s.CallTool(context.Background(), &mcpsdk.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		t.Fatalf("CallTool(%s): %v", name, err)
 	}
-	var out struct {
-		Count   int `json:"count"`
-		Entries []struct {
-			Type    string `json:"type"`
-			Summary string `json:"summary"`
-		} `json:"entries"`
-	}
-	decodeStructured(t, res, &out)
-	if out.Count != 2 || len(out.Entries) != 2 {
-		t.Fatalf("expected 2 entries, got %d", out.Count)
-	}
-	if out.Entries[0].Summary != "third" {
-		t.Errorf("newest entry = %q, want %q", out.Entries[0].Summary, "third")
-	}
-
-	// type filter restricts to checkpoints.
-	res = call(t, s, "oplog_recent", map[string]any{"limit": 10, "type": "checkpoint"})
-	decodeStructured(t, res, &out)
-	if out.Count != 1 || out.Entries[0].Type != "checkpoint" {
-		t.Errorf("type filter failed: %+v", out)
-	}
-}
-
-func TestInterruptClearsFocus(t *testing.T) {
-	s := newClient(t)
-	call(t, s, "oplog_start_work", map[string]any{"project": "DERS", "task": "OAuth"})
-
-	res := call(t, s, "oplog_interrupt", map[string]any{"reason": "Production issue"})
-	if res.IsError {
-		t.Fatalf("interrupt error: %s", resultText(res))
-	}
-
-	res = call(t, s, "oplog_current_focus", map[string]any{})
-	var out struct {
-		Active bool `json:"active"`
-	}
-	decodeStructured(t, res, &out)
-	if out.Active {
-		t.Error("expected focus cleared after interrupt")
-	}
-}
-
-func TestInterruptWithoutFocusIsError(t *testing.T) {
-	s := newClient(t)
-	res := call(t, s, "oplog_interrupt", map[string]any{"reason": "x"})
-	if !res.IsError {
-		t.Error("expected tool error when interrupting with no active focus")
-	}
-}
-
-func TestEndWorkClearsFocus(t *testing.T) {
-	s := newClient(t)
-	call(t, s, "oplog_start_work", map[string]any{"project": "DERS", "task": "OAuth"})
-
-	res := call(t, s, "oplog_end_work", map[string]any{"summary": "All tests passing."})
-	if res.IsError {
-		t.Fatalf("end_work error: %s", resultText(res))
-	}
-
-	res = call(t, s, "oplog_current_focus", map[string]any{})
-	var out struct {
-		Active bool `json:"active"`
-	}
-	decodeStructured(t, res, &out)
-	if out.Active {
-		t.Error("expected focus cleared after end_work")
-	}
+	return res
 }

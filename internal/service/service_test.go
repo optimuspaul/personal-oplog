@@ -10,14 +10,15 @@ import (
 	"github.com/optimuspaul/personal-oplog/internal/persistence"
 	"github.com/optimuspaul/personal-oplog/internal/persistence/jsonl"
 	"github.com/optimuspaul/personal-oplog/internal/persistence/types"
+	"github.com/optimuspaul/personal-oplog/internal/projection"
 	"github.com/optimuspaul/personal-oplog/internal/service"
 )
 
 var baseTime = time.Date(2026, 6, 23, 20, 15, 0, 0, time.UTC)
 
 // newTestService wires the service to a real JSONL store with a clock that
-// advances one second per call (so entries are deterministically ordered)
-// and sequential IDs.
+// advances one second per call (so events are deterministically ordered) and
+// sequential IDs.
 func newTestService(t *testing.T) (*service.Service, persistence.Store) {
 	t.Helper()
 	store, err := jsonl.NewStore(t.TempDir())
@@ -41,330 +42,289 @@ func newTestService(t *testing.T) (*service.Service, persistence.Store) {
 	return svc, store
 }
 
-func allEntries(t *testing.T, store persistence.Store) []types.Entry {
+func allEvents(t *testing.T, store persistence.Store) []types.Event {
 	t.Helper()
-	entries, err := store.ListEntries(context.Background(), types.EntryFilter{})
+	events, err := store.ListEvents(context.Background(), types.EventFilter{})
 	if err != nil {
-		t.Fatalf("ListEntries: %v", err)
+		t.Fatalf("ListEvents: %v", err)
 	}
-	return entries
+	return events
 }
 
-func TestStartWorkSetsFocusAndRecordsEntry(t *testing.T) {
+func mustStart(t *testing.T, svc *service.Service, in service.StartInput) projection.Task {
+	t.Helper()
+	task, err := svc.Start(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	return task
+}
+
+func TestStartCreatesTaskSetsActiveAndRecordsEvents(t *testing.T) {
 	svc, store := newTestService(t)
-	ctx := context.Background()
 
-	focus, err := svc.StartWork(ctx, service.StartWorkInput{Project: "DERS", Task: "OAuth"})
-	if err != nil {
-		t.Fatalf("StartWork: %v", err)
+	task := mustStart(t, svc, service.StartInput{Project: "DERS", Name: "OAuth"})
+	if task.Project != "DERS" || task.Name != "OAuth" {
+		t.Errorf("task project/name = %q/%q", task.Project, task.Name)
 	}
-	if focus.Project != "DERS" || focus.Task != "OAuth" {
-		t.Errorf("focus project/task = %q/%q", focus.Project, focus.Task)
-	}
-	if focus.SessionID == "" {
-		t.Error("expected a session id")
-	}
-	if !focus.StartedAt.Equal(baseTime) {
-		t.Errorf("StartedAt = %v, want %v", focus.StartedAt, baseTime)
+	if task.Status != projection.StatusActive {
+		t.Errorf("status = %q, want active", task.Status)
 	}
 
-	stored, err := store.GetCurrentFocus(ctx)
-	if err != nil || stored == nil {
-		t.Fatalf("GetCurrentFocus: %v / %v", stored, err)
-	}
-	if stored.SessionID != focus.SessionID {
-		t.Errorf("stored session id = %q, want %q", stored.SessionID, focus.SessionID)
+	// task_created + focus_start.
+	events := allEvents(t, store)
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
 	}
 
-	entries := allEntries(t, store)
-	if len(entries) != 1 || entries[0].Type != types.EntryTypeStartWork {
-		t.Fatalf("expected one start_work entry, got %+v", entries)
+	focus, err := svc.Focus(context.Background())
+	if err != nil || focus == nil {
+		t.Fatalf("Focus: %v / %v", focus, err)
+	}
+	if focus.ID != task.ID {
+		t.Errorf("focus id = %q, want %q", focus.ID, task.ID)
 	}
 }
 
-func TestStartWorkValidation(t *testing.T) {
+func TestStartRequiresProjectAndNameWhenCreating(t *testing.T) {
 	svc, _ := newTestService(t)
-	ctx := context.Background()
-
-	if _, err := svc.StartWork(ctx, service.StartWorkInput{Task: "OAuth"}); err == nil {
+	if _, err := svc.Start(context.Background(), service.StartInput{Name: "x"}); err == nil {
 		t.Error("expected error when project missing")
 	}
-	if _, err := svc.StartWork(ctx, service.StartWorkInput{Project: "DERS"}); err == nil {
-		t.Error("expected error when task missing")
+	if _, err := svc.Start(context.Background(), service.StartInput{Project: "x"}); err == nil {
+		t.Error("expected error when name missing")
 	}
 }
 
-func TestStartWorkOverwritesFocus(t *testing.T) {
-	svc, store := newTestService(t)
-	ctx := context.Background()
-
-	if _, err := svc.StartWork(ctx, service.StartWorkInput{Project: "A", Task: "one"}); err != nil {
-		t.Fatalf("StartWork: %v", err)
-	}
-	if _, err := svc.StartWork(ctx, service.StartWorkInput{Project: "B", Task: "two"}); err != nil {
-		t.Fatalf("StartWork: %v", err)
-	}
-	focus, _ := store.GetCurrentFocus(ctx)
-	if focus == nil || focus.Project != "B" {
-		t.Errorf("expected focus on B, got %+v", focus)
-	}
-}
-
-func TestLogUsesFocusFallback(t *testing.T) {
+func TestStartResumesExistingTask(t *testing.T) {
 	svc, _ := newTestService(t)
 	ctx := context.Background()
 
-	if _, err := svc.StartWork(ctx, service.StartWorkInput{Project: "DERS", Task: "OAuth"}); err != nil {
-		t.Fatalf("StartWork: %v", err)
+	task := mustStart(t, svc, service.StartInput{Project: "DERS", Name: "OAuth"})
+	if _, err := svc.Park(ctx, service.ParkInput{Reason: types.ParkPaused}); err != nil {
+		t.Fatalf("Park: %v", err)
 	}
 
-	entry, err := svc.Log(ctx, service.LogInput{Text: "Investigated Auth0 scopes."})
+	resumed := mustStart(t, svc, service.StartInput{TaskID: task.ID})
+	if resumed.ID != task.ID || resumed.Status != projection.StatusActive {
+		t.Errorf("resume did not reactivate task: %+v", resumed)
+	}
+}
+
+func TestStartUnknownTaskErrors(t *testing.T) {
+	svc, _ := newTestService(t)
+	if _, err := svc.Start(context.Background(), service.StartInput{TaskID: "nope"}); !errors.Is(err, service.ErrTaskNotFound) {
+		t.Errorf("expected ErrTaskNotFound, got %v", err)
+	}
+}
+
+func TestParkAndCompleteDeriveStatus(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	task := mustStart(t, svc, service.StartInput{Project: "A", Name: "one"})
+
+	parked, err := svc.Park(ctx, service.ParkInput{Reason: types.ParkInterrupted})
 	if err != nil {
-		t.Fatalf("Log: %v", err)
+		t.Fatalf("Park: %v", err)
 	}
-	if entry.Project != "DERS" || entry.Task != "OAuth" {
-		t.Errorf("expected project/task from focus, got %q/%q", entry.Project, entry.Task)
+	if parked.Status != projection.StatusParked || parked.ParkReason != types.ParkInterrupted {
+		t.Errorf("unexpected parked task: %+v", parked)
 	}
-	if entry.Type != types.EntryTypeLog || entry.Summary != "Investigated Auth0 scopes." {
-		t.Errorf("unexpected entry %+v", entry)
+
+	// After parking, nothing is in focus, so Complete needs an explicit id.
+	done, err := svc.Complete(ctx, service.CompleteInput{TaskID: task.ID, Summary: "shipped"})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if done.Status != projection.StatusDone {
+		t.Errorf("status = %q, want done", done.Status)
 	}
 }
 
-func TestLogExplicitOverridesFocus(t *testing.T) {
+func TestParkBlockedDerivesBlockedStatus(t *testing.T) {
 	svc, _ := newTestService(t)
 	ctx := context.Background()
 
-	if _, err := svc.StartWork(ctx, service.StartWorkInput{Project: "DERS", Task: "OAuth"}); err != nil {
-		t.Fatalf("StartWork: %v", err)
-	}
-	entry, err := svc.Log(ctx, service.LogInput{Project: "OTHER", Task: "Billing", Text: "note"})
+	mustStart(t, svc, service.StartInput{Project: "A", Name: "one"})
+	parked, err := svc.Park(ctx, service.ParkInput{Reason: types.ParkBlocked})
 	if err != nil {
-		t.Fatalf("Log: %v", err)
+		t.Fatalf("Park: %v", err)
 	}
-	if entry.Project != "OTHER" || entry.Task != "Billing" {
-		t.Errorf("explicit project/task not honored: %+v", entry)
+	if parked.Status != projection.StatusBlocked {
+		t.Errorf("park reason blocked should derive blocked status, got %q", parked.Status)
 	}
 }
 
-func TestLogRequiresText(t *testing.T) {
+func TestResolveFallsBackToFocus(t *testing.T) {
 	svc, _ := newTestService(t)
-	if _, err := svc.Log(context.Background(), service.LogInput{Project: "DERS"}); err == nil {
-		t.Error("expected error when text missing")
-	}
-}
-
-func TestLogRequiresProjectWithoutFocus(t *testing.T) {
-	svc, _ := newTestService(t)
-	if _, err := svc.Log(context.Background(), service.LogInput{Text: "orphan note"}); err == nil {
-		t.Error("expected error when no project and no focus")
-	}
-}
-
-func TestCheckpointRequiresSummary(t *testing.T) {
-	svc, _ := newTestService(t)
-	_, err := svc.Checkpoint(context.Background(), service.CheckpointInput{Project: "DERS", Task: "OAuth"})
-	if err == nil {
-		t.Error("expected error when summary missing")
-	}
-}
-
-func TestCheckpointStoresAllFields(t *testing.T) {
-	svc, store := newTestService(t)
 	ctx := context.Background()
 
-	in := service.CheckpointInput{
-		Project:       "DERS",
-		Task:          "OAuth",
-		Summary:       "Password grant passes.",
-		NextAction:    "Inspect audience parameter.",
-		OpenQuestions: []string{"Is hey-api sending audience correctly?"},
-		Files:         []string{"oauth_test.go"},
-		Tags:          []string{"oauth"},
-	}
-	entry, err := svc.Checkpoint(ctx, in)
+	mustStart(t, svc, service.StartInput{Project: "DERS", Name: "OAuth"})
+	e, err := svc.Note(ctx, service.NoteInput{Text: "investigated scopes"})
 	if err != nil {
+		t.Fatalf("Note: %v", err)
+	}
+	if e.Type != types.EventNote || e.Text != "investigated scopes" {
+		t.Errorf("unexpected note: %+v", e)
+	}
+}
+
+func TestNoteAndCheckpointValidation(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	mustStart(t, svc, service.StartInput{Project: "A", Name: "one"})
+
+	if _, err := svc.Note(ctx, service.NoteInput{}); err == nil {
+		t.Error("expected error when note text missing")
+	}
+	if _, err := svc.Checkpoint(ctx, service.CheckpointInput{}); err == nil {
+		t.Error("expected error when checkpoint summary missing")
+	}
+}
+
+func TestOperationsWithoutFocusError(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	if _, err := svc.Park(ctx, service.ParkInput{}); !errors.Is(err, service.ErrNoActiveFocus) {
+		t.Errorf("Park: expected ErrNoActiveFocus, got %v", err)
+	}
+	if _, err := svc.Complete(ctx, service.CompleteInput{}); !errors.Is(err, service.ErrNoActiveFocus) {
+		t.Errorf("Complete: expected ErrNoActiveFocus, got %v", err)
+	}
+}
+
+func TestInterruptionLineageAndLooseThreads(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	// Start task A, then get pulled into B (interruption): park A, start B
+	// originating from A.
+	taskA := mustStart(t, svc, service.StartInput{Project: "ADS", Name: "RPV query"})
+	if _, err := svc.Park(ctx, service.ParkInput{Reason: types.ParkInterrupted, CauseTaskID: ""}); err != nil {
+		t.Fatalf("Park: %v", err)
+	}
+	taskB := mustStart(t, svc, service.StartInput{
+		Project: "ADS", Name: "prod fire drill",
+		FromTaskID: taskA.ID, OriginRel: types.RelInterrupts,
+	})
+
+	if taskB.OriginTaskID != taskA.ID || taskB.OriginRel != types.RelInterrupts {
+		t.Errorf("lineage not recorded on B: %+v", taskB)
+	}
+
+	// A is now a loose thread; B is the focus and must be excluded.
+	threads, err := svc.LooseThreads(ctx)
+	if err != nil {
+		t.Fatalf("LooseThreads: %v", err)
+	}
+	if len(threads) != 1 || threads[0].ID != taskA.ID {
+		t.Fatalf("expected A as the sole loose thread, got %+v", threads)
+	}
+}
+
+func TestBlockedThenUnblockedIsReadyToResume(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	blocked := mustStart(t, svc, service.StartInput{Project: "P", Name: "needs schema"})
+	blocker := mustStart(t, svc, service.StartInput{Project: "P", Name: "schema change"})
+
+	// schema change blocks needs-schema; park the blocked task.
+	if _, err := svc.Link(ctx, service.LinkInput{FromTaskID: blocker.ID, ToTaskID: blocked.ID, Rel: types.RelBlocks}); err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	if _, err := svc.Park(ctx, service.ParkInput{TaskID: blocked.ID, Reason: types.ParkBlocked}); err != nil {
+		t.Fatalf("Park: %v", err)
+	}
+
+	// Resolve the blocker.
+	if _, err := svc.Link(ctx, service.LinkInput{FromTaskID: blocker.ID, ToTaskID: blocked.ID, Rel: types.RelBlocks, Resolved: true}); err != nil {
+		t.Fatalf("resolve Link: %v", err)
+	}
+	// Complete the blocker so it isn't itself a loose thread.
+	if _, err := svc.Complete(ctx, service.CompleteInput{TaskID: blocker.ID}); err != nil {
+		t.Fatalf("Complete blocker: %v", err)
+	}
+
+	threads, err := svc.LooseThreads(ctx)
+	if err != nil {
+		t.Fatalf("LooseThreads: %v", err)
+	}
+	if len(threads) != 1 || threads[0].ID != blocked.ID {
+		t.Fatalf("expected the unblocked task as the loose thread, got %+v", threads)
+	}
+	if !threads[0].ReadyToResume {
+		t.Error("expected ready_to_resume after blocker resolved")
+	}
+}
+
+func TestListTasksAndProjects(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	mustStart(t, svc, service.StartInput{Project: "ADS", Name: "monkey task"})
+	mustStart(t, svc, service.StartInput{Project: "ADS", Name: "banana task"})
+	mustStart(t, svc, service.StartInput{Project: "OTHER", Name: "monkey wrench"})
+
+	matches, err := svc.ListTasks(ctx, service.ListTasksInput{Query: "monkey"})
+	if err != nil {
+		t.Fatalf("ListTasks: %v", err)
+	}
+	if len(matches) != 2 {
+		t.Errorf("expected 2 monkey matches, got %d", len(matches))
+	}
+
+	scoped, err := svc.ListTasks(ctx, service.ListTasksInput{Query: "monkey", Project: "ADS"})
+	if err != nil {
+		t.Fatalf("ListTasks scoped: %v", err)
+	}
+	if len(scoped) != 1 || scoped[0].Project != "ADS" {
+		t.Errorf("project scope failed: %+v", scoped)
+	}
+
+	projects, err := svc.Projects(ctx)
+	if err != nil {
+		t.Fatalf("Projects: %v", err)
+	}
+	if len(projects) != 2 {
+		t.Errorf("expected 2 projects, got %d", len(projects))
+	}
+}
+
+func TestContextReturnsLatestCheckpoint(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	mustStart(t, svc, service.StartInput{Project: "DERS", Name: "OAuth"})
+	if _, err := svc.Checkpoint(ctx, service.CheckpointInput{Summary: "first"}); err != nil {
 		t.Fatalf("Checkpoint: %v", err)
 	}
-	if entry.Type != types.EntryTypeCheckpoint {
-		t.Errorf("type = %q", entry.Type)
+	if _, err := svc.Note(ctx, service.NoteInput{Text: "a later note"}); err != nil {
+		t.Fatalf("Note: %v", err)
+	}
+	if _, err := svc.Checkpoint(ctx, service.CheckpointInput{Summary: "second", NextAction: "ship it"}); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
 	}
 
-	stored := allEntries(t, store)
-	if len(stored) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(stored))
+	c, err := svc.Context(ctx, "")
+	if err != nil {
+		t.Fatalf("Context: %v", err)
 	}
-	got := stored[0]
-	if got.NextAction != in.NextAction || len(got.OpenQuestions) != 1 || len(got.Files) != 1 || len(got.Tags) != 1 {
-		t.Errorf("fields not persisted: %+v", got)
+	if c.LatestCheckpoint == nil || c.LatestCheckpoint.Summary != "second" {
+		t.Errorf("expected latest checkpoint 'second', got %+v", c.LatestCheckpoint)
 	}
 }
 
-func TestResumeReturnsMostRecentCheckpoint(t *testing.T) {
+func TestRecentNewestFirstWithDefaultLimit(t *testing.T) {
 	svc, _ := newTestService(t)
 	ctx := context.Background()
 
-	mustCheckpoint(t, svc, service.CheckpointInput{Project: "DERS", Task: "OAuth", Summary: "first"})
-	mustLog(t, svc, service.LogInput{Project: "DERS", Task: "OAuth", Text: "a log between checkpoints"})
-	mustCheckpoint(t, svc, service.CheckpointInput{Project: "DERS", Task: "OAuth", Summary: "second"})
-	// A checkpoint for a different project must not be returned.
-	mustCheckpoint(t, svc, service.CheckpointInput{Project: "OTHER", Task: "x", Summary: "elsewhere"})
-
-	got, err := svc.Resume(ctx, service.ResumeInput{Project: "DERS"})
-	if err != nil {
-		t.Fatalf("Resume: %v", err)
-	}
-	if got == nil || got.Summary != "second" {
-		t.Errorf("expected most recent checkpoint 'second', got %+v", got)
-	}
-}
-
-func TestResumeNoEntriesReturnsNil(t *testing.T) {
-	svc, _ := newTestService(t)
-	got, err := svc.Resume(context.Background(), service.ResumeInput{Project: "DERS"})
-	if err != nil {
-		t.Fatalf("Resume: %v", err)
-	}
-	if got != nil {
-		t.Errorf("expected nil for a project with no entries, got %+v", got)
-	}
-}
-
-func TestResumeFallsBackToLastEntryWhenNoCheckpoint(t *testing.T) {
-	svc, _ := newTestService(t)
-	ctx := context.Background()
-
-	// Activity but no checkpoint: start, log, interrupt.
-	mustStart(t, svc, service.StartWorkInput{Project: "DERS", Task: "OAuth"})
-	mustLog(t, svc, service.LogInput{Text: "investigated scopes"})
-	if _, err := svc.Interrupt(ctx, service.InterruptInput{Reason: "prod issue"}); err != nil {
-		t.Fatalf("Interrupt: %v", err)
-	}
-
-	got, err := svc.Resume(ctx, service.ResumeInput{Project: "DERS"})
-	if err != nil {
-		t.Fatalf("Resume: %v", err)
-	}
-	if got == nil {
-		t.Fatal("expected fallback to the last entry, got nil")
-	}
-	// The interrupt is the most recent entry.
-	if got.Type != types.EntryTypeInterrupt || got.Summary != "prod issue" {
-		t.Errorf("expected the interrupt entry, got %+v", got)
-	}
-}
-
-func TestResumePrefersCheckpointOverLaterEntries(t *testing.T) {
-	svc, _ := newTestService(t)
-	ctx := context.Background()
-
-	mustStart(t, svc, service.StartWorkInput{Project: "DERS", Task: "OAuth"})
-	mustCheckpoint(t, svc, service.CheckpointInput{Summary: "the checkpoint"})
-	mustLog(t, svc, service.LogInput{Text: "a later log"})
-
-	got, err := svc.Resume(ctx, service.ResumeInput{Project: "DERS"})
-	if err != nil {
-		t.Fatalf("Resume: %v", err)
-	}
-	// Even though the log is newer, the checkpoint wins.
-	if got == nil || got.Type != types.EntryTypeCheckpoint || got.Summary != "the checkpoint" {
-		t.Errorf("expected the checkpoint, got %+v", got)
-	}
-}
-
-func TestResumeFromCurrentFocus(t *testing.T) {
-	svc, _ := newTestService(t)
-	ctx := context.Background()
-
-	if _, err := svc.StartWork(ctx, service.StartWorkInput{Project: "DERS", Task: "OAuth"}); err != nil {
-		t.Fatalf("StartWork: %v", err)
-	}
-	mustCheckpoint(t, svc, service.CheckpointInput{Summary: "from focus"})
-
-	got, err := svc.Resume(ctx, service.ResumeInput{})
-	if err != nil {
-		t.Fatalf("Resume: %v", err)
-	}
-	if got == nil || got.Summary != "from focus" {
-		t.Errorf("expected checkpoint 'from focus', got %+v", got)
-	}
-}
-
-func TestResumeNoArgsNoFocusErrors(t *testing.T) {
-	svc, _ := newTestService(t)
-	_, err := svc.Resume(context.Background(), service.ResumeInput{})
-	if !errors.Is(err, service.ErrNoActiveFocus) {
-		t.Errorf("expected ErrNoActiveFocus, got %v", err)
-	}
-}
-
-func TestInterruptRecordsEntryAndClearsFocus(t *testing.T) {
-	svc, store := newTestService(t)
-	ctx := context.Background()
-
-	if _, err := svc.StartWork(ctx, service.StartWorkInput{Project: "DERS", Task: "OAuth"}); err != nil {
-		t.Fatalf("StartWork: %v", err)
-	}
-	entry, err := svc.Interrupt(ctx, service.InterruptInput{Reason: "Production issue"})
-	if err != nil {
-		t.Fatalf("Interrupt: %v", err)
-	}
-	if entry.Type != types.EntryTypeInterrupt || entry.Summary != "Production issue" {
-		t.Errorf("unexpected interrupt entry %+v", entry)
-	}
-	if entry.Project != "DERS" || entry.Task != "OAuth" {
-		t.Errorf("interrupt should capture focused task, got %+v", entry)
-	}
-
-	focus, _ := store.GetCurrentFocus(ctx)
-	if focus != nil {
-		t.Errorf("expected focus cleared, got %+v", focus)
-	}
-}
-
-func TestInterruptWithoutFocusErrors(t *testing.T) {
-	svc, _ := newTestService(t)
-	_, err := svc.Interrupt(context.Background(), service.InterruptInput{Reason: "x"})
-	if !errors.Is(err, service.ErrNoActiveFocus) {
-		t.Errorf("expected ErrNoActiveFocus, got %v", err)
-	}
-}
-
-func TestEndWorkRecordsEntryAndClearsFocus(t *testing.T) {
-	svc, store := newTestService(t)
-	ctx := context.Background()
-
-	if _, err := svc.StartWork(ctx, service.StartWorkInput{Project: "DERS", Task: "OAuth"}); err != nil {
-		t.Fatalf("StartWork: %v", err)
-	}
-	entry, err := svc.EndWork(ctx, service.EndWorkInput{Summary: "OAuth tests passing."})
-	if err != nil {
-		t.Fatalf("EndWork: %v", err)
-	}
-	if entry.Type != types.EntryTypeEndWork || entry.Summary != "OAuth tests passing." {
-		t.Errorf("unexpected end_work entry %+v", entry)
-	}
-
-	focus, _ := store.GetCurrentFocus(ctx)
-	if focus != nil {
-		t.Errorf("expected focus cleared, got %+v", focus)
-	}
-}
-
-func TestEndWorkWithoutFocusErrors(t *testing.T) {
-	svc, _ := newTestService(t)
-	_, err := svc.EndWork(context.Background(), service.EndWorkInput{Summary: "x"})
-	if !errors.Is(err, service.ErrNoActiveFocus) {
-		t.Errorf("expected ErrNoActiveFocus, got %v", err)
-	}
-}
-
-func TestRecentReturnsNewestFirstWithDefaultLimit(t *testing.T) {
-	svc, _ := newTestService(t)
-	ctx := context.Background()
-
-	// 12 entries; default limit is 10.
+	mustStart(t, svc, service.StartInput{Project: "DERS", Name: "OAuth"})
 	for i := range 12 {
-		mustLog(t, svc, service.LogInput{Project: "DERS", Task: "OAuth", Text: fmt.Sprintf("note %02d", i)})
+		if _, err := svc.Note(ctx, service.NoteInput{Text: fmt.Sprintf("note %02d", i)}); err != nil {
+			t.Fatalf("Note: %v", err)
+		}
 	}
 
 	got, err := svc.Recent(ctx, service.RecentInput{})
@@ -372,79 +332,32 @@ func TestRecentReturnsNewestFirstWithDefaultLimit(t *testing.T) {
 		t.Fatalf("Recent: %v", err)
 	}
 	if len(got) != service.DefaultRecentLimit {
-		t.Fatalf("got %d entries, want default %d", len(got), service.DefaultRecentLimit)
+		t.Fatalf("got %d events, want default %d", len(got), service.DefaultRecentLimit)
 	}
-	// Newest first: the last-written note ("note 11") must be first.
-	if got[0].Summary != "note 11" {
-		t.Errorf("first entry = %q, want %q (newest first)", got[0].Summary, "note 11")
-	}
-}
-
-func TestRecentRespectsLimitAndType(t *testing.T) {
-	svc, _ := newTestService(t)
-	ctx := context.Background()
-
-	mustStart(t, svc, service.StartWorkInput{Project: "DERS", Task: "OAuth"})
-	mustLog(t, svc, service.LogInput{Text: "a log"})
-	mustCheckpoint(t, svc, service.CheckpointInput{Summary: "a checkpoint"})
-
-	got, err := svc.Recent(ctx, service.RecentInput{Limit: 1})
-	if err != nil {
-		t.Fatalf("Recent: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("limit=1 returned %d entries", len(got))
-	}
-
-	got, err = svc.Recent(ctx, service.RecentInput{Limit: 5, Type: types.EntryTypeCheckpoint})
-	if err != nil {
-		t.Fatalf("Recent (typed): %v", err)
-	}
-	if len(got) != 1 || got[0].Type != types.EntryTypeCheckpoint {
-		t.Errorf("type filter failed: %+v", got)
+	if got[0].Text != "note 11" {
+		t.Errorf("first event = %q, want %q (newest first)", got[0].Text, "note 11")
 	}
 }
 
-func TestSearchDelegatesFilter(t *testing.T) {
+func TestSearchByProjectAndType(t *testing.T) {
 	svc, _ := newTestService(t)
 	ctx := context.Background()
 
-	mustCheckpoint(t, svc, service.CheckpointInput{Project: "DERS", Task: "OAuth", Summary: "keep"})
-	mustLog(t, svc, service.LogInput{Project: "OTHER", Task: "x", Text: "drop"})
+	mustStart(t, svc, service.StartInput{Project: "DERS", Name: "OAuth"})
+	if _, err := svc.Checkpoint(ctx, service.CheckpointInput{Summary: "keep me"}); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	mustStart(t, svc, service.StartInput{Project: "OTHER", Name: "x"})
+	if _, err := svc.Checkpoint(ctx, service.CheckpointInput{Summary: "elsewhere"}); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
 
-	got, err := svc.Search(ctx, types.EntryFilter{Types: []types.EntryType{types.EntryTypeCheckpoint}})
+	got, err := svc.Search(ctx, service.SearchInput{Project: "DERS", Type: types.EventCheckpoint})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
-	if len(got) != 1 || got[0].Summary != "keep" {
-		t.Errorf("expected only the checkpoint, got %+v", got)
-	}
-}
-
-func TestFullWorkflow(t *testing.T) {
-	svc, store := newTestService(t)
-	ctx := context.Background()
-
-	mustStart(t, svc, service.StartWorkInput{Project: "DERS", Task: "OAuth"})
-	mustCheckpoint(t, svc, service.CheckpointInput{
-		Summary:    "Password grant passes. Client credentials failing.",
-		NextAction: "Inspect audience parameter.",
-	})
-	if _, err := svc.Interrupt(ctx, service.InterruptInput{Reason: "Production issue"}); err != nil {
-		t.Fatalf("Interrupt: %v", err)
-	}
-
-	got, err := svc.Resume(ctx, service.ResumeInput{Project: "DERS"})
-	if err != nil {
-		t.Fatalf("Resume: %v", err)
-	}
-	if got == nil || got.NextAction != "Inspect audience parameter." {
-		t.Errorf("resume lost the checkpoint: %+v", got)
-	}
-
-	// start, checkpoint, interrupt => 3 entries.
-	if entries := allEntries(t, store); len(entries) != 3 {
-		t.Errorf("expected 3 entries, got %d", len(entries))
+	if len(got) != 1 || got[0].Summary != "keep me" {
+		t.Errorf("expected only the DERS checkpoint, got %+v", got)
 	}
 }
 
@@ -454,55 +367,28 @@ type failingStore struct {
 	appendErr bool
 }
 
-func (f failingStore) AppendEntry(context.Context, types.Entry) error {
+func (f failingStore) AppendEvent(context.Context, types.Event) error {
 	if f.appendErr {
 		return errors.New("disk full")
 	}
 	return nil
 }
-func (failingStore) ListEntries(context.Context, types.EntryFilter) ([]types.Entry, error) {
+
+func (failingStore) ListEvents(context.Context, types.EventFilter) ([]types.Event, error) {
 	return nil, errors.New("read failed")
 }
-func (failingStore) GetCurrentFocus(context.Context) (*types.Focus, error) { return nil, nil }
-func (failingStore) SetCurrentFocus(context.Context, types.Focus) error    { return nil }
-func (failingStore) ClearCurrentFocus(context.Context) error               { return nil }
 
 func TestCheckpointPropagatesStoreError(t *testing.T) {
+	// ListEvents fails first (during focus resolution), so any error suffices.
 	svc := service.New(failingStore{appendErr: true})
-	_, err := svc.Checkpoint(context.Background(), service.CheckpointInput{
-		Project: "DERS", Task: "OAuth", Summary: "s",
-	})
-	if err == nil {
+	if _, err := svc.Checkpoint(context.Background(), service.CheckpointInput{TaskID: "t", Summary: "s"}); err == nil {
 		t.Error("expected store error to propagate")
 	}
 }
 
-func TestSearchPropagatesStoreError(t *testing.T) {
+func TestProjectsPropagatesStoreError(t *testing.T) {
 	svc := service.New(failingStore{})
-	if _, err := svc.Search(context.Background(), types.EntryFilter{}); err == nil {
+	if _, err := svc.Projects(context.Background()); err == nil {
 		t.Error("expected store error to propagate")
-	}
-}
-
-// --- helpers ---
-
-func mustStart(t *testing.T, svc *service.Service, in service.StartWorkInput) {
-	t.Helper()
-	if _, err := svc.StartWork(context.Background(), in); err != nil {
-		t.Fatalf("StartWork: %v", err)
-	}
-}
-
-func mustLog(t *testing.T, svc *service.Service, in service.LogInput) {
-	t.Helper()
-	if _, err := svc.Log(context.Background(), in); err != nil {
-		t.Fatalf("Log: %v", err)
-	}
-}
-
-func mustCheckpoint(t *testing.T, svc *service.Service, in service.CheckpointInput) {
-	t.Helper()
-	if _, err := svc.Checkpoint(context.Background(), in); err != nil {
-		t.Fatalf("Checkpoint: %v", err)
 	}
 }

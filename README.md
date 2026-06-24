@@ -1,14 +1,29 @@
 # Oplog — Local-First Work Journal (MCP)
 
-Oplog is a local-first work journal and context-tracking system. It helps you
-(and your agents) recover from interruptions and resume work quickly by
-capturing checkpoints of what you were doing, what you discovered, what's
-unresolved, and the next action to take.
+Oplog is a local-first work journal and context-tracking system. It models a
+day as what it really is — a web of tasks that spawn, interrupt, and block one
+another — and surfaces the **loose threads** you set aside and never closed.
 
-The journal is append-only and stored as plain files on disk, so it works
-completely offline. Functionality is exposed over the
+The journal is a single **append-only event stream**. Every read-side view —
+the current focus, each task's status, the open projects, the loose threads — is
+*derived* from those events, so the same history can be reinterpreted in new
+ways without migrating data. It is stored as a plain file on disk, works
+completely offline, and is exposed over the
 [Model Context Protocol (MCP)](https://modelcontextprotocol.io), letting agents
 participate directly.
+
+### Model
+
+- **Event** — one append-only record: a task created, focus started, parked,
+  checkpointed, noted, completed, abandoned, or two tasks linked.
+- **Task** — belongs to a project; its status (`new`, `active`, `parked`,
+  `blocked`, `done`, `abandoned`) is derived from its events.
+- **Relationship** — a task→task edge: `originated_from`, `interrupts`,
+  `blocks` (resolvable), or `relates_to`.
+- **Focus** — the one active task, derived (no stored mutable state).
+- **Loose thread** — an open task that isn't the focus, ranked by staleness;
+  a task held by a blocker that has since been resolved is flagged
+  *ready to resume*.
 
 ## How it works
 
@@ -20,7 +35,9 @@ MCP client (e.g. Claude Code)
         │
   internal/mcp               ← MCP tool adapters
         │
-  internal/service           ← application logic (IDs, timestamps, validation, focus)
+  internal/service           ← write events + answer queries (IDs, timestamps, validation)
+        │
+  internal/projection        ← folds the event stream into tasks, focus, threads
         │
   internal/persistence       ← Store interface
    └── internal/persistence/jsonl  ← append-only JSONL backend (default)
@@ -36,12 +53,11 @@ Data is written under `~/.oplog` by default (override with `--dir`):
 
 ```
 ~/.oplog/
-├── log.jsonl            append-only journal entries (one JSON object per line)
-├── current_focus.json  the active task, if any
-├── projects/
-├── sessions/
-└── backups/
+└── events.jsonl   append-only event log (one JSON object per line)
 ```
+
+That single file is the whole journal — there is no separate state or focus
+file to keep in sync.
 
 ## Install
 
@@ -104,11 +120,24 @@ Other clients (the install script does this for you):
 - **Cursor** — `mcpServers` entry in `~/.cursor/mcp.json`.
 - **Codex** — `[mcp_servers.oplog]` block in `~/.codex/config.toml`.
 
-## Slash commands
+## The `/oplog` command
 
-The `commands/` directory holds ready-made slash commands (`/oplog-start`,
-`/oplog-checkpoint`, `/oplog-resume`, …) that call the MCP tools directly, so
-you don't have to phrase a prompt. Install them into your client(s) with:
+There is a single command, `/oplog`, that interprets plain language and records
+it for you. You don't pick a tool or phrase a checkpoint — you just say what
+happened:
+
+```
+/oplog started on the monkey task
+/oplog got pulled into a prod fire drill
+/oplog checkpoint: backfill done, next is the RPV triggers
+/oplog the schema change blocks the RPV query
+/oplog what are my loose threads?
+```
+
+It resolves which task and project you mean (asking only when genuinely
+ambiguous), parks or completes whatever you were on when you switch — detecting
+interruptions from your wording so it doesn't nag — and surfaces threads that
+are ready to pick back up. Install it into your client(s) with:
 
 ```bash
 ./install-commands.sh                 # all clients (default)
@@ -122,33 +151,49 @@ you don't have to phrase a prompt. Install them into your client(s) with:
 | Codex CLI   | `~/.codex/prompts/`    | stripped (Codex also supports `$ARGUMENTS`) |
 | Cursor      | `~/.cursor/commands/`  | stripped |
 
-The commands require the `oplog` MCP server to be connected in that client, and
-take effect after restarting it (or reopening its command palette).
+The command requires the `oplog` MCP server to be connected in that client, and
+takes effect after restarting it (or reopening its command palette).
 
 ## MCP tools
 
-| Tool                  | Purpose                                                            |
-| --------------------- | ----------------------------------------------------------------- |
-| `oplog_start_work`    | Begin a session on a project/task; sets the current focus.        |
-| `oplog_log`           | Record a free-form note. Project/task default to the focus.       |
-| `oplog_checkpoint`    | Capture resumable context: state, next action, open questions.    |
-| `oplog_interrupt`     | Mark the current task interrupted and clear the focus.            |
-| `oplog_resume`        | Most recent checkpoint for a project/task; falls back to the last entry of any type if there's no checkpoint. |
-| `oplog_current_focus` | Return the task currently in progress, if any.                    |
-| `oplog_search`        | Search entries by project, task, tags, text, or type.            |
-| `oplog_recent`        | Return the most recent N entries (optionally one type).           |
-| `oplog_end_work`      | Mark the session complete and clear the focus.                    |
+The tools are small, orthogonal primitives; the `/oplog` command composes them.
+You can also call them directly.
 
-> Tool names use underscores rather than dots (`oplog_start_work`, not
-> `oplog.start_work`): the Anthropic API restricts tool names to
-> `[a-zA-Z0-9_-]`.
+**Write** (append events):
 
-### Typical workflow
+| Tool               | Purpose                                                           |
+| ------------------ | ----------------------------------------------------------------- |
+| `oplog_start`      | Begin or resume focus on a task; creates the task if new.         |
+| `oplog_park`       | Set a task aside (`interrupted`/`blocked`/`waiting`/`switched`/`paused`). |
+| `oplog_complete`   | Mark a task finished.                                             |
+| `oplog_abandon`    | Drop a task that won't be resumed.                               |
+| `oplog_checkpoint` | Capture resumable context: state, next action, open questions.    |
+| `oplog_note`       | Record a free-form note against a task.                          |
+| `oplog_link`       | Record a task→task edge; `resolved: true` clears a blocks edge.   |
 
-1. `oplog_start_work` — `{ "project": "DERS", "task": "OAuth compliance tests" }`
-2. `oplog_checkpoint` — `{ "summary": "Password grant passes. Client credentials failing.", "next_action": "Inspect audience parameter." }`
-3. `oplog_interrupt` — `{ "reason": "Production issue" }`
-4. Later: `oplog_resume` — `{ "project": "DERS" }` reconstructs where you left off.
+**Read** (derived projections):
+
+| Tool              | Purpose                                                            |
+| ----------------- | ----------------------------------------------------------------- |
+| `oplog_focus`     | The task currently in progress, if any.                           |
+| `oplog_tasks`     | Find tasks by fuzzy name / project / status (task resolution).    |
+| `oplog_projects`  | Known projects with task and open-task counts.                    |
+| `oplog_threads`   | Loose threads, ranked: ready-to-resume first, then stalest.       |
+| `oplog_context`   | Reconstruct a task: latest checkpoint + recent events.            |
+| `oplog_recent`    | The most recent N events (optionally one type).                   |
+| `oplog_search`    | Search events by task, project, text, type, or tags.             |
+
+> Tool names use underscores rather than dots (`oplog_start`, not
+> `oplog.start`): the Anthropic API restricts tool names to `[a-zA-Z0-9_-]`.
+
+### A messy day, recorded
+
+1. `oplog_start` — `{ "project": "ADS", "name": "RPV query" }`
+2. Pulled into a fire drill: `oplog_park` — `{ "reason": "interrupted" }`, then
+   `oplog_start` — `{ "project": "ADS", "name": "prod fire drill", "from_task_id": "<RPV id>", "origin_rel": "interrupts" }`
+3. Back later: `oplog_complete` the drill, `oplog_start` — `{ "task_id": "<RPV id>" }` to resume.
+4. `oplog_threads` shows anything you parked and never closed — including tasks
+   whose blocker has since been resolved, flagged *ready to resume*.
 
 ## Development
 
@@ -167,10 +212,11 @@ cmd/poplog-local-mcp/  stdio MCP server entrypoint
 internal/
 ├── id/                ULID generator (sortable, dependency-free)
 ├── persistence/
-│   ├── store.go       Store interface
-│   ├── types/         domain types (Entry, Focus, Session, EntryFilter)
+│   ├── store.go       Store interface (AppendEvent / ListEvents)
+│   ├── types/         domain types (Event, EventFilter, enums)
 │   └── jsonl/         append-only JSONL Store implementation
-├── service/           journal + focus application logic
+├── projection/        folds events into tasks, focus, projects, loose threads
+├── service/           event-writing + projection-querying application logic
 └── mcp/               MCP tool definitions and adapters
 ```
 

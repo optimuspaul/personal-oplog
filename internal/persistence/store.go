@@ -13,22 +13,15 @@ import (
 
 // Store is the persistence contract for the journal.
 //
-// Entries are append-only. Focus is the single mutable piece of state,
-// representing the task the user is currently working on.
+// The journal is a pure append-only event log: AppendEvent adds one record,
+// ListEvents reads them back. There is no mutable state — current focus, task
+// status, and every other view are projections derived from the event stream
+// by the projection package.
 type Store interface {
-	// AppendEntry durably appends a single entry to the journal.
-	AppendEntry(ctx context.Context, entry types.Entry) error
+	// AppendEvent durably appends a single event to the journal.
+	AppendEvent(ctx context.Context, event types.Event) error
 
-	// ListEntries returns entries matching the filter, ordered from most
-	// recent to oldest.
-	ListEntries(ctx context.Context, filter types.EntryFilter) ([]types.Entry, error)
-
-	// GetCurrentFocus returns the active focus, or nil if no task is active.
-	GetCurrentFocus(ctx context.Context) (*types.Focus, error)
-
-	// SetCurrentFocus replaces the active focus.
-	SetCurrentFocus(ctx context.Context, focus types.Focus) error
-
-	// ClearCurrentFocus removes the active focus, leaving no task active.
-	ClearCurrentFocus(ctx context.Context) error
+	// ListEvents returns events matching the filter, ordered from most recent
+	// to oldest.
+	ListEvents(ctx context.Context, filter types.EventFilter) ([]types.Event, error)
 }

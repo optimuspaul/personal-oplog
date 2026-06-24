@@ -1,539 +1,125 @@
-# Oplog MCP - Local First Work Journal
+# Oplog — Design
 
-## Overview
+## What it is
 
-Oplog is a local-first work journal and context-tracking system designed to help users recover from interruptions and resume work quickly.
+Oplog is a local-first work journal. A working day is not a list of sessions —
+it is a *reticulum*: tasks spawn other tasks, interruptions pull you away, and
+threads get parked and forgotten. Oplog models that shape directly and, above
+all, surfaces the **loose threads** you set aside and never closed.
 
-The initial implementation will be a local MCP server written in Go that stores work logs in a directory on disk. Future versions can evolve into a networked service while maintaining compatibility with the original storage and tool interfaces.
+## The core idea: one event log, many projections
 
----
+The journal is a single append-only stream of **events**. Nothing else is
+stored — not "current focus", not task status, not a project list. Every
+read-side view is *derived* by folding the events:
 
-# Goals
+```
+events (truth)  ──fold──▶  tasks · focus · projects · loose threads
+```
 
-The primary goal is to capture and restore working context.
+This is what makes the model flexible: to reinterpret history a new way, add a
+projection — never a migration. It also removes the only piece of mutable state
+the old design had (`current_focus.json`), and with it the bug where starting a
+new task silently dropped the previous one.
 
-Instead of relying on memory, users and agents can create checkpoints containing:
+### Three layers, kept distinct
 
-* What they were working on
-* What they discovered
-* What remains unresolved
-* The next action to take
+The earlier sketch conflated them; keeping them separate is what makes loose
+threads fall out cleanly:
 
-A user should be able to return to a task after hours or days and reconstruct their mental state in under a minute.
+1. **Durable task graph** — tasks and the permanent edges between them.
+2. **Temporal event log** — what happened, in order.
+3. **Live attention state** — what's active vs. set aside. *Loose threads live
+   here, cross-referenced with the graph.*
 
----
+## Events
 
-# Design Principles
+One flat, union-style record (`internal/persistence/types.Event`); which fields
+matter depends on `Type`:
 
-## Local First
+| Type           | Meaning                                              | Key fields |
+| -------------- | ---------------------------------------------------- | ---------- |
+| `task_created` | introduce a task into a project                      | `task_id`, `project`, `name`, `origin_task_id`, `origin_rel` |
+| `focus_start`  | begin or resume active work                          | `task_id`, `from_task_id` |
+| `park`         | set aside while still open                           | `task_id`, `reason`, `cause_task_id` |
+| `checkpoint`   | resumable context                                    | `summary`, `next_action`, `open_questions` |
+| `note`         | free-form note                                       | `text` |
+| `complete`     | finished                                             | `task_id`, `summary` |
+| `abandon`      | dropped, won't resume                                | `task_id`, `summary` (reason) |
+| `link`         | task→task edge                                       | `task_id` (from), `to_task_id`, `rel`, `resolved` |
 
-All data is stored locally by default.
+`park.reason` ∈ {`interrupted`, `blocked`, `waiting`, `switched`, `paused`}.
+`rel` ∈ {`originated_from`, `interrupts`, `blocks`, `relates_to`}.
 
-The application must function completely offline.
+Note that an **interruption** is not a graph edge — it is a moment in time: a
+`park(reason=interrupted)` on the old task plus a `focus_start` on the new one
+(optionally with `origin_rel=interrupts`). Only `blocks`/`relates_to`/
+`originated_from` are durable edges; `blocks` is resolvable via a later
+`link(..., resolved=true)`.
 
-## Append-Only
+## Projections (`internal/projection`)
 
-Journal entries should be append-only wherever possible.
+`Build(events)` folds the stream into a `World`, which answers:
 
-This provides:
+- **Tasks** — each with derived `status`: `new` → `active` → `parked`/`blocked`
+  → `done`/`abandoned`. `blocked` is an overlay: an open task with an unresolved
+  incoming `blocks` edge (or parked specifically because it was blocked).
+- **Focus** — the active task with the most recent `focus_start`, or none.
+- **Projects** — derived namespaces with task/open counts.
+- **LooseThreads(now)** — open tasks that aren't the focus, ranked
+  ready-to-resume first (a task once held by a blocker that's now resolved),
+  then stalest first.
+- **Match(tasks, query)** — fuzzy name lookup for task resolution.
 
-* Auditability
-* Simplicity
-* Reliability
-* Easy synchronization later
+Projections are pure functions over `[]Event`, so they are trivially testable
+and never touch storage.
 
-## AI-Agnostic Core
+## Layers
 
-The journal system should not depend on AI.
+```
+internal/mcp          MCP tool adapters (thin)
+internal/service      append events; answer queries via projections
+internal/projection   fold events → tasks/focus/projects/threads (pure)
+internal/persistence  Store interface: AppendEvent / ListEvents
+  └── jsonl           append-only events.jsonl backend (default)
+```
 
-Agents are clients of the journal, not part of the journal itself.
+`Store` stays a dumb append/scan boundary so JSONL can later become SQLite,
+Postgres, or a remote API without touching tool contracts.
 
-## MCP Friendly
+## Interface: one interpreting command
 
-All core functionality should be exposed through MCP tools.
+Instead of a command per operation, a single `/oplog <plain language>` command
+interprets intent and orchestrates the primitives:
 
-## Future-Proof Storage
+1. Classify the message (start/note/checkpoint/park/complete/abandon/link/read).
+2. Resolve the task with `oplog_tasks` (fuzzy). No match → pick/﻿create a project
+   via `oplog_projects`. Several → ask.
+3. On a switch, check `oplog_focus`: if the wording signals an interruption,
+   auto-park the old task and record the lineage; otherwise ask once whether the
+   previous task was finished or set aside. Never silently supersede.
+4. Record the event(s) and confirm, surfacing any ready-to-resume thread.
 
-Storage should be abstracted behind interfaces so local files can later be replaced with:
+The MCP server does no NLP — it offers deterministic primitives and lookups; the
+command supplies the interpretation and conversation.
 
-* SQLite
-* PostgreSQL
-* Remote HTTP APIs
-* Cloud synchronization
+## Storage
 
-without changing MCP tool contracts.
-
----
-
-# Initial Directory Structure
-
-```text
+```
 ~/.oplog/
-├── log.jsonl
-├── current_focus.json
-├── projects/
-├── sessions/
-└── backups/
+└── events.jsonl   one JSON object per line, append-only
 ```
 
----
-
-# Storage Format
-
-## Journal Entries
-
-Store entries in JSONL format.
-
-File:
-
-```text
-~/.oplog/log.jsonl
-```
-
-Example entry:
-
-```json
-{
-  "id": "01JXYZABC123",
-  "timestamp": "2026-06-23T21:15:00-05:00",
-  "type": "checkpoint",
-  "project": "DERS",
-  "task": "OAuth compliance tests",
-  "summary": "Password grant passes. Client credentials failing.",
-  "next_action": "Inspect audience parameter.",
-  "open_questions": [
-    "Is hey-api sending audience correctly?"
-  ],
-  "files": [
-    "auth_test.go",
-    "oauth_test.go"
-  ],
-  "tags": [
-    "oauth",
-    "auth0"
-  ]
-}
-```
-
----
-
-# Core Domain Model
-
-## Entry
-
-```go
-type Entry struct {
-    ID            string
-    Timestamp     time.Time
-
-    Type          string
-
-    Project       string
-    Task          string
-
-    Summary       string
-    NextAction    string
-
-    OpenQuestions []string
-    Files         []string
-    Tags          []string
-}
-```
-
----
-
-## Focus
-
-Represents what the user is currently working on.
-
-```go
-type Focus struct {
-    Project     string
-    Task        string
-    SessionID   string
-    StartedAt   time.Time
-}
-```
-
----
-
-## Session
-
-```go
-type Session struct {
-    ID          string
-    Project     string
-    Task        string
-
-    StartedAt   time.Time
-    EndedAt     *time.Time
-
-    Status      string
-}
-```
-
-Status examples:
-
-* active
-* interrupted
-* completed
-
----
-
-# Package Structure
-
-```text
-cmd/
-└── poplog-local-mcp/
-    └── main.go
-
-internal/
-├── domain/
-│   ├── entry.go
-│   ├── focus.go
-│   └── session.go
-│
-├── store/
-│   ├── store.go
-│   └── jsonl_store.go
-│
-├── search/
-│   └── search.go
-│
-├── service/
-│   ├── journal.go
-│   └── focus.go
-│
-└── mcp/
-    ├── server.go
-    └── tools.go
-```
-
----
-
-# Storage Interface
-
-All persistence should be hidden behind a Store interface.
-
-```go
-type Store interface {
-    AppendEntry(
-        ctx context.Context,
-        entry Entry,
-    ) error
-
-    ListEntries(
-        ctx context.Context,
-        filter EntryFilter,
-    ) ([]Entry, error)
-
-    GetCurrentFocus(
-        ctx context.Context,
-    ) (*Focus, error)
-
-    SetCurrentFocus(
-        ctx context.Context,
-        focus Focus,
-    ) error
-}
-```
-
-Initial implementation:
-
-```go
-type JSONLStore struct{}
-```
-
-Future implementations:
-
-```go
-type SQLiteStore struct{}
-type PostgresStore struct{}
-type HTTPStore struct{}
-```
-
----
-
-# MCP Tools
-
-## oplog.start_work
-
-Start a work session.
-
-Input:
-
-```json
-{
-  "project": "DERS",
-  "task": "OAuth compliance tests"
-}
-```
-
----
-
-## oplog.log
-
-Create a simple journal entry.
-
-Input:
-
-```json
-{
-  "project": "DERS",
-  "task": "OAuth compliance tests",
-  "text": "Investigated Auth0 scopes."
-}
-```
-
----
-
-## oplog.checkpoint
-
-Capture resumable context.
-
-Input:
-
-```json
-{
-  "project": "DERS",
-  "task": "OAuth compliance tests",
-  "summary": "Password flow passes. Client credentials failing.",
-  "next_action": "Inspect audience parameter.",
-  "open_questions": [
-    "Is hey-api sending audience correctly?"
-  ]
-}
-```
-
-This is expected to become the most frequently used tool.
-
----
-
-## oplog.interrupt
-
-Mark the current task as interrupted.
-
-Input:
-
-```json
-{
-  "reason": "Production issue"
-}
-```
-
-Behavior:
-
-* Capture current state
-* Mark session interrupted
-* Clear active focus
-
----
-
-## oplog.resume
-
-Retrieve the most recent checkpoint for a project or task.
-
-Input:
-
-```json
-{
-  "project": "DERS"
-}
-```
-
-Example output:
-
-```text
-Project: DERS
-Task: OAuth compliance tests
-
-Last checkpoint:
-Password grant passes.
-Client credentials fails.
-
-Next action:
-Inspect audience parameter.
-```
-
----
-
-## oplog.current_focus
-
-Returns the currently active task.
-
-Example output:
-
-```json
-{
-  "project": "DERS",
-  "task": "OAuth compliance tests",
-  "started_at": "2026-06-23T20:15:00-05:00"
-}
-```
-
----
-
-## oplog.search
-
-Search journal entries.
-
-Search fields:
-
-* project
-* task
-* tags
-* text
-
----
-
-## oplog.end_work
-
-Mark a session as completed.
-
-Input:
-
-```json
-{
-  "summary": "OAuth compliance tests passing."
-}
-```
-
----
-
-# Example Workflow
-
-## Begin Work
-
-```text
-oplog.start_work
-```
-
-Working on:
-
-```text
-DERS
-OAuth compliance tests
-```
-
----
-
-## Capture Progress
-
-```text
-oplog.checkpoint
-```
-
-Summary:
-
-```text
-Password grant passes.
-Client credentials failing.
-```
-
-Next action:
-
-```text
-Inspect audience parameter.
-```
-
----
-
-## Interrupted
-
-```text
-oplog.interrupt
-```
-
-Reason:
-
-```text
-Production issue.
-```
-
----
-
-## Resume Later
-
-```text
-oplog.resume
-```
-
-Output:
-
-```text
-You were working on:
-
-Project:
-DERS
-
-Task:
-OAuth compliance tests
-
-Known state:
-Password grant passes.
-Client credentials failing.
-
-Next action:
-Inspect audience parameter.
-```
-
----
-
-# Future Enhancements
-
-## SQLite Backend
-
-Replace JSONL scanning with indexed queries.
-
-## Full-Text Search
-
-Search:
-
-* notes
-* summaries
-* checkpoints
-* tags
-
-## Synchronization
-
-Support:
-
-* Git
-* S3
-* Remote API
-
-## Multi-Device Support
-
-Use a remote Oplog service.
-
-## Agent Summaries
-
-Allow agents to:
-
-* summarize sessions
-* generate daily reports
-* identify stale work
-* recommend next actions
-
-## Timeline View
-
-Generate a chronological activity history.
-
-## Automatic Context Recovery
-
-Agents can reconstruct context from:
-
-* checkpoints
-* recent logs
-* active files
-* linked repositories
-
----
-
-# Long-Term Vision
-
-Oplog is an append-only operational journal for humans and agents.
-
-It serves as a durable memory layer that captures work context, interruptions, discoveries, and next actions.
-
-The local file-based implementation is the foundation. MCP enables agents to participate immediately, while the storage abstraction allows the system to evolve into a synchronized service without changing user workflows.
+## Principles
+
+- **Local first** — all data on disk; fully offline.
+- **Append-only, event-sourced** — events are truth; state is derived.
+- **AI-agnostic core** — agents are clients of the journal, not part of it.
+- **Future-proof storage** — persistence hidden behind an interface.
+
+## Possible future work
+
+- Materialized projection cache / SQLite backend for large logs.
+- Timeline and reticulum (spawn-tree) visualizations.
+- Daily report: what moved, what's still loose, what's newly unblocked.
+- Sync (git / S3 / remote API) and multi-device.
