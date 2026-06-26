@@ -23,27 +23,27 @@ func registerTools(server *mcpsdk.Server, svc *service.Service) {
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        "oplog_park",
-		Description: "Set a task aside while leaving it open. task_id defaults to the current focus. reason is one of: interrupted, blocked, waiting, switched, paused. cause_task_id records what pulled attention away.",
+		Description: "Set a task aside while leaving it open. Identify the task by task_id (a ULID) or task (a name to resolve); both omitted defaults to the current focus. reason is one of: interrupted, blocked, waiting, switched, paused. cause_task_id records what pulled attention away.",
 	}, parkHandler(svc))
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        "oplog_complete",
-		Description: "Mark a task finished. task_id defaults to the current focus.",
+		Description: "Mark a task finished. Identify the task by task_id (a ULID) or task (a name to resolve); both omitted defaults to the current focus.",
 	}, completeHandler(svc))
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        "oplog_abandon",
-		Description: "Drop a task that will not be resumed. task_id defaults to the current focus.",
+		Description: "Drop a task that will not be resumed. Identify the task by task_id (a ULID) or task (a name to resolve); both omitted defaults to the current focus.",
 	}, abandonHandler(svc))
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        "oplog_checkpoint",
-		Description: "Capture resumable context: current state, next action, open questions. task_id defaults to the current focus.",
+		Description: "Capture resumable context: current state, next action, open questions. Identify the task by task_id (a ULID) or task (a name to resolve); both omitted defaults to the current focus.",
 	}, checkpointHandler(svc))
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        "oplog_note",
-		Description: "Record a free-form note. task_id defaults to the current focus.",
+		Description: "Record a free-form note. Identify the task by task_id (a ULID) or task (a name to resolve); both omitted defaults to the current focus.",
 	}, noteHandler(svc))
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
@@ -73,7 +73,7 @@ func registerTools(server *mcpsdk.Server, svc *service.Service) {
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        "oplog_context",
-		Description: "Reconstruct context for a task: its latest checkpoint and most recent events. task_id defaults to the current focus.",
+		Description: "Reconstruct context for a task: its latest checkpoint and most recent events. Identify the task by task_id (a ULID) or task (a name to resolve); both omitted defaults to the current focus.",
 	}, contextHandler(svc))
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
@@ -116,7 +116,8 @@ func startHandler(svc *service.Service) mcpsdk.ToolHandlerFor[startInput, taskOu
 // --- park ---
 
 type parkInput struct {
-	TaskID      string `json:"task_id,omitempty" jsonschema:"task to park; defaults to the current focus"`
+	TaskID      string `json:"task_id,omitempty" jsonschema:"id of the task to park; defaults to the current focus"`
+	Task        string `json:"task,omitempty" jsonschema:"name (fuzzy) of the task to park, resolved to a single task; alternative to task_id"`
 	Reason      string `json:"reason,omitempty" jsonschema:"interrupted, blocked, waiting, switched, or paused"`
 	CauseTaskID string `json:"cause_task_id,omitempty" jsonschema:"id of the task that pulled attention away"`
 }
@@ -125,6 +126,7 @@ func parkHandler(svc *service.Service) mcpsdk.ToolHandlerFor[parkInput, taskOutp
 	return func(ctx context.Context, _ *mcpsdk.CallToolRequest, in parkInput) (*mcpsdk.CallToolResult, taskOutput, error) {
 		task, err := svc.Park(ctx, service.ParkInput{
 			TaskID:      in.TaskID,
+			Query:       in.Task,
 			Reason:      types.ParkReason(in.Reason),
 			CauseTaskID: in.CauseTaskID,
 		})
@@ -138,13 +140,14 @@ func parkHandler(svc *service.Service) mcpsdk.ToolHandlerFor[parkInput, taskOutp
 // --- complete ---
 
 type completeInput struct {
-	TaskID  string `json:"task_id,omitempty" jsonschema:"task to complete; defaults to the current focus"`
+	TaskID  string `json:"task_id,omitempty" jsonschema:"id of the task to complete; defaults to the current focus"`
+	Task    string `json:"task,omitempty" jsonschema:"name (fuzzy) of the task to complete, resolved to a single task; alternative to task_id"`
 	Summary string `json:"summary,omitempty" jsonschema:"summary of the completed work"`
 }
 
 func completeHandler(svc *service.Service) mcpsdk.ToolHandlerFor[completeInput, taskOutput] {
 	return func(ctx context.Context, _ *mcpsdk.CallToolRequest, in completeInput) (*mcpsdk.CallToolResult, taskOutput, error) {
-		task, err := svc.Complete(ctx, service.CompleteInput{TaskID: in.TaskID, Summary: in.Summary})
+		task, err := svc.Complete(ctx, service.CompleteInput{TaskID: in.TaskID, Query: in.Task, Summary: in.Summary})
 		if err != nil {
 			return nil, taskOutput{}, err
 		}
@@ -155,13 +158,14 @@ func completeHandler(svc *service.Service) mcpsdk.ToolHandlerFor[completeInput, 
 // --- abandon ---
 
 type abandonInput struct {
-	TaskID string `json:"task_id,omitempty" jsonschema:"task to abandon; defaults to the current focus"`
+	TaskID string `json:"task_id,omitempty" jsonschema:"id of the task to abandon; defaults to the current focus"`
+	Task   string `json:"task,omitempty" jsonschema:"name (fuzzy) of the task to abandon, resolved to a single task; alternative to task_id"`
 	Reason string `json:"reason,omitempty" jsonschema:"why the task is being dropped"`
 }
 
 func abandonHandler(svc *service.Service) mcpsdk.ToolHandlerFor[abandonInput, taskOutput] {
 	return func(ctx context.Context, _ *mcpsdk.CallToolRequest, in abandonInput) (*mcpsdk.CallToolResult, taskOutput, error) {
-		task, err := svc.Abandon(ctx, service.AbandonInput{TaskID: in.TaskID, Reason: in.Reason})
+		task, err := svc.Abandon(ctx, service.AbandonInput{TaskID: in.TaskID, Query: in.Task, Reason: in.Reason})
 		if err != nil {
 			return nil, taskOutput{}, err
 		}
@@ -172,7 +176,8 @@ func abandonHandler(svc *service.Service) mcpsdk.ToolHandlerFor[abandonInput, ta
 // --- checkpoint ---
 
 type checkpointInput struct {
-	TaskID        string   `json:"task_id,omitempty" jsonschema:"task to checkpoint; defaults to the current focus"`
+	TaskID        string   `json:"task_id,omitempty" jsonschema:"id of the task to checkpoint; defaults to the current focus"`
+	Task          string   `json:"task,omitempty" jsonschema:"name (fuzzy) of the task to checkpoint, resolved to a single task; alternative to task_id"`
 	Summary       string   `json:"summary" jsonschema:"the current state of the work"`
 	NextAction    string   `json:"next_action,omitempty" jsonschema:"the next concrete step to take"`
 	OpenQuestions []string `json:"open_questions,omitempty" jsonschema:"unresolved questions"`
@@ -184,6 +189,7 @@ func checkpointHandler(svc *service.Service) mcpsdk.ToolHandlerFor[checkpointInp
 	return func(ctx context.Context, _ *mcpsdk.CallToolRequest, in checkpointInput) (*mcpsdk.CallToolResult, eventOutput, error) {
 		e, err := svc.Checkpoint(ctx, service.CheckpointInput{
 			TaskID:        in.TaskID,
+			Query:         in.Task,
 			Summary:       in.Summary,
 			NextAction:    in.NextAction,
 			OpenQuestions: in.OpenQuestions,
@@ -200,7 +206,8 @@ func checkpointHandler(svc *service.Service) mcpsdk.ToolHandlerFor[checkpointInp
 // --- note ---
 
 type noteInput struct {
-	TaskID string   `json:"task_id,omitempty" jsonschema:"task to note against; defaults to the current focus"`
+	TaskID string   `json:"task_id,omitempty" jsonschema:"id of the task to note against; defaults to the current focus"`
+	Task   string   `json:"task,omitempty" jsonschema:"name (fuzzy) of the task to note against, resolved to a single task; alternative to task_id"`
 	Text   string   `json:"text" jsonschema:"the note to record"`
 	Tags   []string `json:"tags,omitempty" jsonschema:"optional tags"`
 	Files  []string `json:"files,omitempty" jsonschema:"optional related file paths"`
@@ -208,7 +215,7 @@ type noteInput struct {
 
 func noteHandler(svc *service.Service) mcpsdk.ToolHandlerFor[noteInput, eventOutput] {
 	return func(ctx context.Context, _ *mcpsdk.CallToolRequest, in noteInput) (*mcpsdk.CallToolResult, eventOutput, error) {
-		e, err := svc.Note(ctx, service.NoteInput{TaskID: in.TaskID, Text: in.Text, Tags: in.Tags, Files: in.Files})
+		e, err := svc.Note(ctx, service.NoteInput{TaskID: in.TaskID, Query: in.Task, Text: in.Text, Tags: in.Tags, Files: in.Files})
 		if err != nil {
 			return nil, eventOutput{}, err
 		}
@@ -318,12 +325,13 @@ func threadsHandler(svc *service.Service) mcpsdk.ToolHandlerFor[threadsInput, th
 // --- context ---
 
 type contextInput struct {
-	TaskID string `json:"task_id,omitempty" jsonschema:"task to reconstruct; defaults to the current focus"`
+	TaskID string `json:"task_id,omitempty" jsonschema:"id of the task to reconstruct; defaults to the current focus"`
+	Task   string `json:"task,omitempty" jsonschema:"name (fuzzy) of the task to reconstruct, resolved to a single task; alternative to task_id"`
 }
 
 func contextHandler(svc *service.Service) mcpsdk.ToolHandlerFor[contextInput, contextOutput] {
 	return func(ctx context.Context, _ *mcpsdk.CallToolRequest, in contextInput) (*mcpsdk.CallToolResult, contextOutput, error) {
-		c, err := svc.Context(ctx, in.TaskID)
+		c, err := svc.Context(ctx, in.TaskID, in.Task)
 		if err != nil {
 			return nil, contextOutput{}, err
 		}

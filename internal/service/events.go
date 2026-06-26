@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/optimuspaul/personal-oplog/internal/persistence/types"
 	"github.com/optimuspaul/personal-oplog/internal/projection"
@@ -15,6 +16,10 @@ var ErrNoActiveFocus = errors.New("no active focus")
 
 // ErrTaskNotFound is returned when an operation references an unknown task ID.
 var ErrTaskNotFound = errors.New("task not found")
+
+// ErrAmbiguousTask is returned when a name query matches more than one task and
+// can't be narrowed to a single open one.
+var ErrAmbiguousTask = errors.New("ambiguous task")
 
 func errFieldRequired(field string) error {
 	return fmt.Errorf("%s is required", field)
@@ -29,9 +34,11 @@ func (s *Service) world(ctx context.Context) (*projection.World, error) {
 	return projection.Build(events), nil
 }
 
-// resolveTaskID validates an explicit task ID, or falls back to the current
-// focus when taskID is empty.
-func (s *Service) resolveTaskID(ctx context.Context, taskID string) (string, error) {
+// resolveTaskID picks the task an operation acts on, in priority order:
+//  1. an explicit task ID (validated against the log);
+//  2. a fuzzy name query, resolved to a single task;
+//  3. the current focus, when neither is given.
+func (s *Service) resolveTaskID(ctx context.Context, taskID, query string) (string, error) {
 	w, err := s.world(ctx)
 	if err != nil {
 		return "", err
@@ -42,11 +49,52 @@ func (s *Service) resolveTaskID(ctx context.Context, taskID string) (string, err
 		}
 		return taskID, nil
 	}
+	if q := strings.TrimSpace(query); q != "" {
+		return resolveByName(w, q)
+	}
 	focus := w.Focus()
 	if focus == nil {
 		return "", ErrNoActiveFocus
 	}
 	return focus.ID, nil
+}
+
+// resolveByName turns a fuzzy name query into a single task ID. A lone match
+// wins outright; when several match, a single open task among them breaks the
+// tie. Anything else is reported as not-found or ambiguous so the caller can
+// fall back to oplog_tasks.
+func resolveByName(w *projection.World, query string) (string, error) {
+	matches := projection.Match(w.Tasks(), query)
+	if len(matches) == 0 {
+		return "", fmt.Errorf("%w matching %q", ErrTaskNotFound, query)
+	}
+	if len(matches) == 1 {
+		return matches[0].ID, nil
+	}
+	var open []projection.Task
+	for _, t := range matches {
+		if t.Status.IsOpen() {
+			open = append(open, t)
+		}
+	}
+	if len(open) == 1 {
+		return open[0].ID, nil
+	}
+	candidates := matches
+	if len(open) > 1 {
+		candidates = open
+	}
+	return "", fmt.Errorf("%w: %q matches %s", ErrAmbiguousTask, query, describeCandidates(candidates))
+}
+
+// describeCandidates renders the competing tasks so an ambiguity error tells the
+// caller exactly which IDs to choose between.
+func describeCandidates(tasks []projection.Task) string {
+	parts := make([]string, 0, len(tasks))
+	for _, t := range tasks {
+		parts = append(parts, fmt.Sprintf("%s (%s/%s, %s)", t.ID, t.Project, t.Name, t.Status))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // appendAndProject appends e, then returns the resulting projected view of
@@ -128,7 +176,7 @@ func (s *Service) Start(ctx context.Context, in StartInput) (projection.Task, er
 			return projection.Task{}, fmt.Errorf("start: %w", err)
 		}
 		taskID = created.ID
-	} else if _, err := s.resolveTaskID(ctx, taskID); err != nil {
+	} else if _, err := s.resolveTaskID(ctx, taskID, ""); err != nil {
 		return projection.Task{}, fmt.Errorf("start: %w", err)
 	}
 
@@ -146,13 +194,14 @@ func (s *Service) Start(ctx context.Context, in StartInput) (projection.Task, er
 // defaults to "paused". CauseTaskID records what pulled attention away.
 type ParkInput struct {
 	TaskID      string
+	Query       string
 	Reason      types.ParkReason
 	CauseTaskID string
 }
 
 // Park records a park event for the resolved task.
 func (s *Service) Park(ctx context.Context, in ParkInput) (projection.Task, error) {
-	taskID, err := s.resolveTaskID(ctx, in.TaskID)
+	taskID, err := s.resolveTaskID(ctx, in.TaskID, in.Query)
 	if err != nil {
 		return projection.Task{}, fmt.Errorf("park: %w", err)
 	}
@@ -174,12 +223,13 @@ func (s *Service) Park(ctx context.Context, in ParkInput) (projection.Task, erro
 // CompleteInput marks a task done. TaskID defaults to the current focus.
 type CompleteInput struct {
 	TaskID  string
+	Query   string
 	Summary string
 }
 
 // Complete records a complete event for the resolved task.
 func (s *Service) Complete(ctx context.Context, in CompleteInput) (projection.Task, error) {
-	taskID, err := s.resolveTaskID(ctx, in.TaskID)
+	taskID, err := s.resolveTaskID(ctx, in.TaskID, in.Query)
 	if err != nil {
 		return projection.Task{}, fmt.Errorf("complete: %w", err)
 	}
@@ -196,12 +246,13 @@ func (s *Service) Complete(ctx context.Context, in CompleteInput) (projection.Ta
 // AbandonInput drops a task. TaskID defaults to the current focus.
 type AbandonInput struct {
 	TaskID string
+	Query  string
 	Reason string
 }
 
 // Abandon records an abandon event for the resolved task.
 func (s *Service) Abandon(ctx context.Context, in AbandonInput) (projection.Task, error) {
-	taskID, err := s.resolveTaskID(ctx, in.TaskID)
+	taskID, err := s.resolveTaskID(ctx, in.TaskID, in.Query)
 	if err != nil {
 		return projection.Task{}, fmt.Errorf("abandon: %w", err)
 	}
@@ -218,6 +269,7 @@ func (s *Service) Abandon(ctx context.Context, in AbandonInput) (projection.Task
 // CheckpointInput captures resumable context. TaskID defaults to the focus.
 type CheckpointInput struct {
 	TaskID        string
+	Query         string
 	Summary       string
 	NextAction    string
 	OpenQuestions []string
@@ -230,7 +282,7 @@ func (s *Service) Checkpoint(ctx context.Context, in CheckpointInput) (types.Eve
 	if in.Summary == "" {
 		return types.Event{}, fmt.Errorf("checkpoint: %w", errFieldRequired("summary"))
 	}
-	taskID, err := s.resolveTaskID(ctx, in.TaskID)
+	taskID, err := s.resolveTaskID(ctx, in.TaskID, in.Query)
 	if err != nil {
 		return types.Event{}, fmt.Errorf("checkpoint: %w", err)
 	}
@@ -254,6 +306,7 @@ func (s *Service) Checkpoint(ctx context.Context, in CheckpointInput) (types.Eve
 // NoteInput records a free-form note. TaskID defaults to the focus.
 type NoteInput struct {
 	TaskID string
+	Query  string
 	Text   string
 	Tags   []string
 	Files  []string
@@ -264,7 +317,7 @@ func (s *Service) Note(ctx context.Context, in NoteInput) (types.Event, error) {
 	if in.Text == "" {
 		return types.Event{}, fmt.Errorf("note: %w", errFieldRequired("text"))
 	}
-	taskID, err := s.resolveTaskID(ctx, in.TaskID)
+	taskID, err := s.resolveTaskID(ctx, in.TaskID, in.Query)
 	if err != nil {
 		return types.Event{}, fmt.Errorf("note: %w", err)
 	}

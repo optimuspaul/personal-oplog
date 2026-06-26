@@ -22,6 +22,11 @@ tasks:
     desc: Run the MCP server over stdio (Ctrl-C to stop)
     cmds:
       - go run {{.PKG}} {{.CLI_ARGS}}
+  
+  interactive:
+    desc: Run MCP explorer
+    cmds:
+      - npx @modelcontextprotocol/inspector go run ./cmd/poplog-local-mcp -- --dir /tmp/oplog-test
 
   go:test:
     desc: Run the test suite with the race detector

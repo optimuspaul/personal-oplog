@@ -72,9 +72,10 @@ func (s *Service) LooseThreads(ctx context.Context) ([]projection.Thread, error)
 }
 
 // Context returns the resume bundle for a task: the task, its latest
-// checkpoint, and its most recent events. TaskID defaults to the focus.
-func (s *Service) Context(ctx context.Context, taskID string) (projection.Context, error) {
-	id, err := s.resolveTaskID(ctx, taskID)
+// checkpoint, and its most recent events. taskID takes precedence; query
+// resolves a task by name; both empty falls back to the focus.
+func (s *Service) Context(ctx context.Context, taskID, query string) (projection.Context, error) {
+	id, err := s.resolveTaskID(ctx, taskID, query)
 	if err != nil {
 		return projection.Context{}, fmt.Errorf("context: %w", err)
 	}

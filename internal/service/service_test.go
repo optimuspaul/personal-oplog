@@ -170,6 +170,77 @@ func TestResolveFallsBackToFocus(t *testing.T) {
 	}
 }
 
+func TestResolveByNameRecordsAgainstMatch(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	target := mustStart(t, svc, service.StartInput{Project: "ADS", Name: "banana split"})
+	// Move focus elsewhere so resolution can't lean on it.
+	mustStart(t, svc, service.StartInput{Project: "ADS", Name: "unrelated"})
+
+	e, err := svc.Note(ctx, service.NoteInput{Query: "banana", Text: "peeled"})
+	if err != nil {
+		t.Fatalf("Note by name: %v", err)
+	}
+	if e.TaskID != target.ID {
+		t.Errorf("note recorded against %q, want %q", e.TaskID, target.ID)
+	}
+}
+
+func TestResolveByNameUnknownErrors(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	mustStart(t, svc, service.StartInput{Project: "ADS", Name: "banana"})
+	if _, err := svc.Note(ctx, service.NoteInput{Query: "zebra", Text: "x"}); !errors.Is(err, service.ErrTaskNotFound) {
+		t.Errorf("expected ErrTaskNotFound, got %v", err)
+	}
+}
+
+func TestResolveByNameAmbiguousErrors(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	mustStart(t, svc, service.StartInput{Project: "ADS", Name: "monkey task"})
+	mustStart(t, svc, service.StartInput{Project: "ADS", Name: "monkey wrench"})
+	if _, err := svc.Note(ctx, service.NoteInput{Query: "monkey", Text: "x"}); !errors.Is(err, service.ErrAmbiguousTask) {
+		t.Errorf("expected ErrAmbiguousTask, got %v", err)
+	}
+}
+
+func TestResolveByNamePrefersSingleOpenTask(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	done := mustStart(t, svc, service.StartInput{Project: "ADS", Name: "monkey task"})
+	open := mustStart(t, svc, service.StartInput{Project: "ADS", Name: "monkey wrench"})
+	if _, err := svc.Complete(ctx, service.CompleteInput{TaskID: done.ID}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	// "monkey" matches both, but only one is still open, so it resolves.
+	e, err := svc.Note(ctx, service.NoteInput{Query: "monkey", Text: "x"})
+	if err != nil {
+		t.Fatalf("Note: %v", err)
+	}
+	if e.TaskID != open.ID {
+		t.Errorf("note recorded against %q, want open task %q", e.TaskID, open.ID)
+	}
+}
+
+func TestExplicitTaskIDBeatsNameQuery(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	byID := mustStart(t, svc, service.StartInput{Project: "ADS", Name: "monkey task"})
+	mustStart(t, svc, service.StartInput{Project: "ADS", Name: "banana task"})
+
+	// task_id wins even when query would point elsewhere.
+	e, err := svc.Note(ctx, service.NoteInput{TaskID: byID.ID, Query: "banana", Text: "x"})
+	if err != nil {
+		t.Fatalf("Note: %v", err)
+	}
+	if e.TaskID != byID.ID {
+		t.Errorf("note recorded against %q, want %q", e.TaskID, byID.ID)
+	}
+}
+
 func TestNoteAndCheckpointValidation(t *testing.T) {
 	svc, _ := newTestService(t)
 	ctx := context.Background()
@@ -307,7 +378,7 @@ func TestContextReturnsLatestCheckpoint(t *testing.T) {
 		t.Fatalf("Checkpoint: %v", err)
 	}
 
-	c, err := svc.Context(ctx, "")
+	c, err := svc.Context(ctx, "", "")
 	if err != nil {
 		t.Fatalf("Context: %v", err)
 	}

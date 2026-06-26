@@ -171,6 +171,11 @@ You can also call them directly.
 | `oplog_note`       | Record a free-form note against a task.                          |
 | `oplog_link`       | Record a task→task edge; `resolved: true` clears a blocks edge.   |
 
+> `park`, `complete`, `abandon`, `checkpoint`, `note`, and `context` target a
+> task by `task_id` (a ULID), or by `task` (a fuzzy name resolved to a single
+> task), or — with both omitted — the current focus. A name that matches more
+> than one open task is rejected as ambiguous; use `oplog_tasks` to pick the id.
+
 **Read** (derived projections):
 
 | Tool              | Purpose                                                            |
