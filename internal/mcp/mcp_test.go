@@ -77,9 +77,9 @@ func decodeStructured(t *testing.T, res *mcpsdk.CallToolResult, target any) {
 }
 
 // startTask creates and starts a task, returning its id.
-func startTask(t *testing.T, s *mcpsdk.ClientSession, project, name string) string {
+func startTask(t *testing.T, s *mcpsdk.ClientSession, name string) string {
 	t.Helper()
-	res := call(t, s, "oplog_start", map[string]any{"project": project, "name": name})
+	res := call(t, s, "oplog_log", map[string]any{"task": name, "action": "start"})
 	var out struct {
 		ID string `json:"id"`
 	}
@@ -98,10 +98,8 @@ func TestListToolsExposesFullSurface(t *testing.T) {
 	}
 
 	want := map[string]bool{
-		"oplog_start": false, "oplog_park": false, "oplog_complete": false,
-		"oplog_abandon": false, "oplog_checkpoint": false, "oplog_note": false,
-		"oplog_link": false, "oplog_focus": false, "oplog_tasks": false,
-		"oplog_projects": false, "oplog_threads": false, "oplog_context": false,
+		"oplog_log": false, "oplog_focus": false, "oplog_tasks": false,
+		"oplog_threads": false, "oplog_context": false,
 		"oplog_recent": false, "oplog_search": false,
 	}
 	for _, tool := range res.Tools {
@@ -113,6 +111,9 @@ func TestListToolsExposesFullSurface(t *testing.T) {
 		if !found {
 			t.Errorf("tool %q not registered", name)
 		}
+	}
+	if len(res.Tools) != len(want) {
+		t.Errorf("expected exactly %d tools, got %d", len(want), len(res.Tools))
 	}
 }
 
@@ -129,7 +130,7 @@ func TestStartAndFocusLifecycle(t *testing.T) {
 		t.Error("expected no active focus initially")
 	}
 
-	startTask(t, s, "DERS", "OAuth")
+	startTask(t, s, "OAuth")
 
 	res = call(t, s, "oplog_focus", map[string]any{})
 	var focus2 struct {
@@ -145,42 +146,42 @@ func TestStartAndFocusLifecycle(t *testing.T) {
 	}
 }
 
-func TestStartMissingFieldsIsError(t *testing.T) {
+func TestLogMissingTaskIsError(t *testing.T) {
 	s := newClient(t)
 	res, err := s.CallTool(context.Background(),
-		&mcpsdk.CallToolParams{Name: "oplog_start", Arguments: map[string]any{"name": "OAuth"}})
+		&mcpsdk.CallToolParams{Name: "oplog_log", Arguments: map[string]any{"action": "start"}})
 	if err == nil && !res.IsError {
-		t.Error("expected error when creating a task without a project")
+		t.Error("expected error when logging without a task reference")
 	}
 }
 
 func TestTasksFuzzyResolution(t *testing.T) {
 	s := newClient(t)
-	startTask(t, s, "ADS", "monkey task")
-	startTask(t, s, "OTHER", "banana split")
+	startTask(t, s, "monkey task")
+	startTask(t, s, "banana split")
 
 	res := call(t, s, "oplog_tasks", map[string]any{"query": "monkey"})
 	var out struct {
 		Count int `json:"count"`
 		Tasks []struct {
-			Project string `json:"project"`
-			Name    string `json:"name"`
+			Name string `json:"name"`
 		} `json:"tasks"`
 	}
 	decodeStructured(t, res, &out)
-	if out.Count != 1 || out.Tasks[0].Project != "ADS" {
+	if out.Count != 1 || out.Tasks[0].Name != "monkey task" {
 		t.Errorf("fuzzy resolution failed: %+v", out)
 	}
 }
 
 func TestCheckpointAndContextRoundTrip(t *testing.T) {
 	s := newClient(t)
-	startTask(t, s, "DERS", "OAuth")
+	id := startTask(t, s, "OAuth")
 
-	call(t, s, "oplog_checkpoint", map[string]any{
-		"summary":        "Password grant passes. Client credentials failing.",
-		"next_action":    "Inspect audience parameter.",
-		"open_questions": []string{"Is hey-api sending audience correctly?"},
+	call(t, s, "oplog_log", map[string]any{
+		"task":        id,
+		"action":      "checkpoint",
+		"message":     "Password grant passes. Client credentials failing.",
+		"next_action": "Inspect audience parameter.",
 	})
 
 	res := call(t, s, "oplog_context", map[string]any{})
@@ -200,8 +201,8 @@ func TestCheckpointAndContextRoundTrip(t *testing.T) {
 
 func TestParkSurfacesAsLooseThread(t *testing.T) {
 	s := newClient(t)
-	startTask(t, s, "ADS", "RPV query")
-	call(t, s, "oplog_park", map[string]any{"reason": "interrupted"})
+	id := startTask(t, s, "RPV query")
+	call(t, s, "oplog_log", map[string]any{"task": id, "action": "park"})
 
 	res := call(t, s, "oplog_threads", map[string]any{})
 	var out struct {
@@ -221,9 +222,9 @@ func TestParkSurfacesAsLooseThread(t *testing.T) {
 
 func TestCompleteRemovesFromFocus(t *testing.T) {
 	s := newClient(t)
-	startTask(t, s, "DERS", "OAuth")
+	id := startTask(t, s, "OAuth")
 
-	call(t, s, "oplog_complete", map[string]any{"summary": "done"})
+	call(t, s, "oplog_log", map[string]any{"task": id, "action": "complete", "message": "done"})
 
 	res := call(t, s, "oplog_focus", map[string]any{})
 	var out struct {
@@ -235,29 +236,30 @@ func TestCompleteRemovesFromFocus(t *testing.T) {
 	}
 }
 
-func TestParkWithoutFocusIsError(t *testing.T) {
+func TestLogUnknownTaskIsError(t *testing.T) {
 	s := newClient(t)
-	res := call0(t, s, "oplog_park", map[string]any{"reason": "paused"})
+	// A non-start action on a task that does not exist must error.
+	res := call0(t, s, "oplog_log", map[string]any{"task": "ghost", "action": "park"})
 	if !res.IsError {
-		t.Error("expected tool error when parking with no active focus")
+		t.Error("expected tool error when parking an unknown task")
 	}
 }
 
 func TestSearchAndRecent(t *testing.T) {
 	s := newClient(t)
-	startTask(t, s, "DERS", "OAuth")
-	call(t, s, "oplog_checkpoint", map[string]any{"summary": "keep me"})
-	call(t, s, "oplog_note", map[string]any{"text": "a note"})
+	id := startTask(t, s, "OAuth")
+	call(t, s, "oplog_log", map[string]any{"task": id, "action": "checkpoint", "message": "keep me"})
+	call(t, s, "oplog_log", map[string]any{"task": id, "action": "note", "message": "a note"})
 
-	res := call(t, s, "oplog_search", map[string]any{"type": "checkpoint"})
+	res := call(t, s, "oplog_search", map[string]any{"action": "checkpoint"})
 	var search struct {
 		Count  int `json:"count"`
 		Events []struct {
-			Summary string `json:"summary"`
+			Message string `json:"message"`
 		} `json:"events"`
 	}
 	decodeStructured(t, res, &search)
-	if search.Count != 1 || search.Events[0].Summary != "keep me" {
+	if search.Count != 1 || search.Events[0].Message != "keep me" {
 		t.Errorf("unexpected search output: %+v", search)
 	}
 

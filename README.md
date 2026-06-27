@@ -5,25 +5,28 @@ day as what it really is — a web of tasks that spawn, interrupt, and block one
 another — and surfaces the **loose threads** you set aside and never closed.
 
 The journal is a single **append-only event stream**. Every read-side view —
-the current focus, each task's status, the open projects, the loose threads — is
-*derived* from those events, so the same history can be reinterpreted in new
-ways without migrating data. It is stored as a plain file on disk, works
-completely offline, and is exposed over the
+the current focus, each task's status, the loose threads — is *derived* from
+those events, so the same history can be reinterpreted in new ways without
+migrating data. It is stored as a plain file on disk, works completely offline,
+and is exposed over the
 [Model Context Protocol (MCP)](https://modelcontextprotocol.io), letting agents
 participate directly.
 
 ### Model
 
-- **Event** — one append-only record: a task created, focus started, parked,
-  checkpointed, noted, completed, abandoned, or two tasks linked.
-- **Task** — belongs to a project; its status (`new`, `active`, `parked`,
-  `blocked`, `done`, `abandoned`) is derived from its events.
-- **Relationship** — a task→task edge: `originated_from`, `interrupts`,
-  `blocks` (resolvable), or `relates_to`.
+- **Event** — one append-only record produced by a single write tool,
+  `oplog_log`. Its `action` (`start`, `resume`, `complete`, `block`, `note`,
+  `park`, `restart`, `checkpoint`) says what happened.
+- **Task** — identified by id and a free-text name (no project grouping); its
+  status (`new`, `active`, `parked`, `blocked`, `done`) is derived from its
+  events. A task is created implicitly the first time you `start` against a new
+  name.
+- **Link** — an optional task→task edge carried on any event; its relationship
+  is inferred from the action (`block` → blocks, `start` → originated-from, else
+  relates-to).
 - **Focus** — the one active task, derived (no stored mutable state).
-- **Loose thread** — an open task that isn't the focus, ranked by staleness;
-  a task held by a blocker that has since been resolved is flagged
-  *ready to resume*.
+- **Loose thread** — an open task that isn't the focus, ranked by staleness; a
+  task blocked on another that has since completed is flagged *ready to resume*.
 
 ## How it works
 
@@ -134,7 +137,7 @@ happened:
 /oplog what are my loose threads?
 ```
 
-It resolves which task and project you mean (asking only when genuinely
+It resolves which task you mean (asking only when genuinely
 ambiguous), parks or completes whatever you were on when you switch — detecting
 interruptions from your wording so it doesn't nag — and surfaces threads that
 are ready to pick back up. Install it into your client(s) with:
@@ -156,49 +159,58 @@ takes effect after restarting it (or reopening its command palette).
 
 ## MCP tools
 
-The tools are small, orthogonal primitives; the `/oplog` command composes them.
-You can also call them directly.
+There is **one write tool** and a handful of read tools; the `/oplog` command
+composes them. You can also call them directly.
 
-**Write** (append events):
+**Write** (append one event):
 
-| Tool               | Purpose                                                           |
-| ------------------ | ----------------------------------------------------------------- |
-| `oplog_start`      | Begin or resume focus on a task; creates the task if new.         |
-| `oplog_park`       | Set a task aside (`interrupted`/`blocked`/`waiting`/`switched`/`paused`). |
-| `oplog_complete`   | Mark a task finished.                                             |
-| `oplog_abandon`    | Drop a task that won't be resumed.                               |
-| `oplog_checkpoint` | Capture resumable context: state, next action, open questions.    |
-| `oplog_note`       | Record a free-form note against a task.                          |
-| `oplog_link`       | Record a task→task edge; `resolved: true` clears a blocks edge.   |
+| Tool        | Purpose                                                                |
+| ----------- | --------------------------------------------------------------------- |
+| `oplog_log` | Append a single event to the journal — the only write surface.         |
 
-> `park`, `complete`, `abandon`, `checkpoint`, `note`, and `context` target a
-> task by `task_id` (a ULID), or by `task` (a fuzzy name resolved to a single
-> task), or — with both omitted — the current focus. A name that matches more
-> than one open task is rejected as ambiguous; use `oplog_tasks` to pick the id.
+`oplog_log` takes:
+
+| Field         | Required | Meaning                                                    |
+| ------------- | -------- | --------------------------------------------------------- |
+| `task`        | yes      | task id (a ULID) or a fuzzy name; a new name creates a task |
+| `action`      | yes      | `start`, `resume`, `complete`, `block`, `note`, `park`, `restart`, or `checkpoint` |
+| `message`     | no       | free text describing the task and/or what happened         |
+| `timestamp`   | no       | when it happened (defaults to now)                          |
+| `link`        | no       | a related task (id or fuzzy name); its relationship is inferred from `action` |
+| `next_action` | no       | for `checkpoint`: the resumable next step                   |
+
+A fuzzy `task` that matches more than one open task is rejected as ambiguous; use
+`oplog_tasks` to pick the id. The `link` relationship is inferred — `block` →
+*blocks*, `start` → *originated-from*, anything else → *relates-to* — so an
+interruption is just `park` the old task then `start`/`resume` the next, linking
+back. A block resolves automatically once its blocker is `complete`.
+
+`complete` is the single way to close a task — whether it shipped, was dropped,
+or was subsumed lives in the `message`, not in a separate status.
 
 **Read** (derived projections):
 
 | Tool              | Purpose                                                            |
 | ----------------- | ----------------------------------------------------------------- |
 | `oplog_focus`     | The task currently in progress, if any.                           |
-| `oplog_tasks`     | Find tasks by fuzzy name / project / status (task resolution).    |
-| `oplog_projects`  | Known projects with task and open-task counts.                    |
+| `oplog_tasks`     | Find tasks by fuzzy name / status (task resolution).              |
 | `oplog_threads`   | Loose threads, ranked: ready-to-resume first, then stalest.       |
 | `oplog_context`   | Reconstruct a task: latest checkpoint + recent events.            |
-| `oplog_recent`    | The most recent N events (optionally one type).                   |
-| `oplog_search`    | Search events by task, project, text, type, or tags.             |
+| `oplog_recent`    | The most recent N events (optionally one action).                 |
+| `oplog_search`    | Search events by task, text, or action.                          |
 
-> Tool names use underscores rather than dots (`oplog_start`, not
-> `oplog.start`): the Anthropic API restricts tool names to `[a-zA-Z0-9_-]`.
+> Tool names use underscores rather than dots (`oplog_log`, not `oplog.log`):
+> the Anthropic API restricts tool names to `[a-zA-Z0-9_-]`.
 
 ### A messy day, recorded
 
-1. `oplog_start` — `{ "project": "ADS", "name": "RPV query" }`
-2. Pulled into a fire drill: `oplog_park` — `{ "reason": "interrupted" }`, then
-   `oplog_start` — `{ "project": "ADS", "name": "prod fire drill", "from_task_id": "<RPV id>", "origin_rel": "interrupts" }`
-3. Back later: `oplog_complete` the drill, `oplog_start` — `{ "task_id": "<RPV id>" }` to resume.
+1. `oplog_log` — `{ "task": "RPV query", "action": "start" }`
+2. Pulled into a fire drill: `oplog_log` — `{ "task": "RPV query", "action": "park", "message": "prod fire" }`,
+   then `oplog_log` — `{ "task": "prod fire drill", "action": "start", "link": "RPV query" }`
+3. Back later: `oplog_log` — `{ "task": "prod fire drill", "action": "complete" }`,
+   then `oplog_log` — `{ "task": "<RPV id>", "action": "resume" }`.
 4. `oplog_threads` shows anything you parked and never closed — including tasks
-   whose blocker has since been resolved, flagged *ready to resume*.
+   whose blocker has since completed, flagged *ready to resume*.
 
 ## Development
 
@@ -220,7 +232,7 @@ internal/
 │   ├── store.go       Store interface (AppendEvent / ListEvents)
 │   ├── types/         domain types (Event, EventFilter, enums)
 │   └── jsonl/         append-only JSONL Store implementation
-├── projection/        folds events into tasks, focus, projects, loose threads
+├── projection/        folds events into tasks, focus, loose threads
 ├── service/           event-writing + projection-querying application logic
 └── mcp/               MCP tool definitions and adapters
 ```

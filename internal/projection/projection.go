@@ -1,6 +1,6 @@
 // Package projection derives every read-side view Oplog exposes — tasks and
-// their status, the current focus, projects, and loose threads — from the
-// append-only event stream.
+// their status, the current focus, and loose threads — from the append-only
+// event stream.
 //
 // Nothing here mutates storage. A World is built by folding events in
 // chronological order; callers then ask it questions. Because the event log
@@ -21,29 +21,26 @@ import (
 type TaskStatus string
 
 const (
-	// StatusNew: created but never started — a not-yet-picked-up thread.
+	// StatusNew: referenced but never started — a not-yet-picked-up thread.
 	StatusNew TaskStatus = "new"
 	// StatusActive: currently being worked on (the focus).
 	StatusActive TaskStatus = "active"
 	// StatusParked: started, then set aside while still open.
 	StatusParked TaskStatus = "parked"
-	// StatusBlocked: parked because of, or held by, an unresolved blocker.
+	// StatusBlocked: set aside with an open blocker.
 	StatusBlocked TaskStatus = "blocked"
-	// StatusDone: completed.
+	// StatusDone: closed — completed, dropped, or subsumed.
 	StatusDone TaskStatus = "done"
-	// StatusAbandoned: dropped, will not be resumed.
-	StatusAbandoned TaskStatus = "abandoned"
 )
 
 // IsOpen reports whether a status represents unfinished work.
 func (s TaskStatus) IsOpen() bool {
-	return s != StatusDone && s != StatusAbandoned
+	return s != StatusDone
 }
 
 // Task is the derived view of a single task at the point the World was built.
 type Task struct {
 	ID          string
-	Project     string
 	Name        string
 	Status      TaskStatus
 	CreatedAt   time.Time
@@ -53,19 +50,17 @@ type Task struct {
 	OriginTaskID string
 	OriginRel    types.Relationship
 
-	// ParkReason is the reason from the most recent park, when parked/blocked.
-	ParkReason types.ParkReason
-
-	// BlockedBy lists task IDs with an unresolved "blocks" edge into this task.
+	// BlockedBy lists task IDs with an open "blocks" edge into this task.
 	BlockedBy []string
-	// Blocks lists task IDs this task has an unresolved "blocks" edge into.
+	// Blocks lists open task IDs this task currently blocks.
 	Blocks []string
 
-	// hadBlocker records that a blocks edge was once recorded against this
-	// task, even if later resolved — used to surface "now unblocked" threads.
-	hadBlocker        bool
-	lastFocusStart    time.Time
-	hasLatestCheckpnt bool
+	// hadBlocker records that a block was once recorded against this task, even
+	// after the blocker cleared — used to surface "now unblocked" threads.
+	hadBlocker     bool
+	blockerIDs     []string // every task ever recorded as blocking this one
+	blockingIDs    []string // every task this one was ever recorded blocking
+	lastFocusStart time.Time
 }
 
 // Thread is a loose thread: an open task that is not the current focus,
@@ -74,17 +69,9 @@ type Thread struct {
 	Task
 	// Idle is how long since the task's last event.
 	Idle time.Duration
-	// ReadyToResume is true when the task was held by a blocker that is now
-	// resolved — the highest-signal thread to revisit.
+	// ReadyToResume is true when the task was held by a blocker that has since
+	// completed — the highest-signal thread to revisit.
 	ReadyToResume bool
-}
-
-// Project is the derived view of a project: a namespace tasks belong to.
-type Project struct {
-	Name        string
-	TaskCount   int
-	OpenCount   int
-	LastEventAt time.Time
 }
 
 // Context bundles everything needed to resume a task: the task itself, its
@@ -122,7 +109,7 @@ func Build(events []types.Event) *World {
 }
 
 // ensure returns the task for id, creating a placeholder if the stream
-// references a task before (or without) a task_created event.
+// references a task before it has been named.
 func (w *World) ensure(id string) *Task {
 	if id == "" {
 		return nil
@@ -137,79 +124,79 @@ func (w *World) ensure(id string) *Task {
 }
 
 func (w *World) apply(e types.Event) {
-	switch e.Type {
-	case types.EventTaskCreated:
-		t := w.ensure(e.TaskID)
-		t.Project = e.Project
+	t := w.ensure(e.TaskID)
+	if t == nil {
+		return
+	}
+	if t.Name == "" && e.Name != "" {
 		t.Name = e.Name
-		t.OriginTaskID = e.OriginTaskID
-		t.OriginRel = e.OriginRel
-		if t.CreatedAt.IsZero() {
-			t.CreatedAt = e.Timestamp
-		}
-		t.touch(e.Timestamp)
+	}
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = e.Timestamp
+	}
+	t.touch(e.Timestamp)
 
-	case types.EventFocusStart:
-		t := w.ensure(e.TaskID)
+	switch e.Action {
+	case types.ActionStart, types.ActionResume, types.ActionRestart:
 		t.Status = StatusActive
-		t.ParkReason = ""
 		t.lastFocusStart = e.Timestamp
-		t.touch(e.Timestamp)
+		if e.Action == types.ActionStart && e.LinkTaskID != "" {
+			t.OriginTaskID = e.LinkTaskID
+			t.OriginRel = types.RelOriginatedFrom
+		}
 
-	case types.EventPark:
-		t := w.ensure(e.TaskID)
+	case types.ActionPark:
 		t.Status = StatusParked
-		t.ParkReason = e.Reason
-		t.touch(e.Timestamp)
 
-	case types.EventComplete:
-		t := w.ensure(e.TaskID)
+	case types.ActionBlock:
+		t.Status = StatusBlocked
+		if blocker := w.ensure(e.LinkTaskID); blocker != nil {
+			t.blockerIDs = addString(t.blockerIDs, blocker.ID)
+			blocker.blockingIDs = addString(blocker.blockingIDs, t.ID)
+			t.hadBlocker = true
+		}
+
+	case types.ActionComplete:
 		t.Status = StatusDone
-		t.touch(e.Timestamp)
 
-	case types.EventAbandon:
-		t := w.ensure(e.TaskID)
-		t.Status = StatusAbandoned
-		t.touch(e.Timestamp)
-
-	case types.EventCheckpoint, types.EventNote:
-		t := w.ensure(e.TaskID)
-		t.touch(e.Timestamp)
-
-	case types.EventLink:
-		w.applyLink(e)
+	case types.ActionCheckpoint, types.ActionNote:
+		// No status change; the touch above records the activity.
 	}
 }
 
-func (w *World) applyLink(e types.Event) {
-	from := w.ensure(e.TaskID)
-	to := w.ensure(e.ToTaskID)
-	if from == nil || to == nil || e.Rel != types.RelBlocks {
-		// Only blocks edges affect derived status; other relationships are
-		// recorded in the log but carry no projected state today.
-		return
-	}
-	if e.Resolved {
-		from.Blocks = removeString(from.Blocks, to.ID)
-		to.BlockedBy = removeString(to.BlockedBy, from.ID)
-		return
-	}
-	from.Blocks = addString(from.Blocks, to.ID)
-	to.BlockedBy = addString(to.BlockedBy, from.ID)
-	to.hadBlocker = true
-}
-
-// finalize applies the blocked overlay once all events are folded: any open
-// task with unresolved blockers (or parked specifically because it was
-// blocked) reads as blocked.
+// finalize resolves block edges against final task states: a block clears once
+// its blocker is done. An open task with any open blocker reads as blocked; one
+// whose blockers have all cleared falls back to parked (and surfaces as
+// ready-to-resume).
 func (w *World) finalize() {
+	// Pass 1: recompute each task's open blockers and adjust status.
 	for _, t := range w.tasks {
-		if !t.Status.IsOpen() {
-			continue
+		open := t.blockerIDs[:0:0]
+		for _, id := range t.blockerIDs {
+			if b := w.tasks[id]; b != nil && b.Status.IsOpen() {
+				open = append(open, id)
+			}
 		}
-		if len(t.BlockedBy) > 0 || t.ParkReason == types.ParkBlocked {
-			t.Status = StatusBlocked
+		t.BlockedBy = open
+		if t.Status.IsOpen() {
+			if len(open) > 0 {
+				t.Status = StatusBlocked
+			} else if t.hadBlocker && t.Status == StatusBlocked {
+				t.Status = StatusParked
+			}
 		}
+	}
+
+	// Pass 2: invert BlockedBy into each blocker's Blocks list.
+	for _, t := range w.tasks {
+		for _, id := range t.BlockedBy {
+			if b := w.tasks[id]; b != nil {
+				b.Blocks = addString(b.Blocks, t.ID)
+			}
+		}
+	}
+
+	for _, t := range w.tasks {
 		sort.Strings(t.BlockedBy)
 		sort.Strings(t.Blocks)
 	}
@@ -241,7 +228,7 @@ func (w *World) Task(id string) *Task {
 }
 
 // Focus returns the task currently being worked on — the active task with the
-// most recent focus_start — or nil when nothing is active.
+// most recent focus-taking event — or nil when nothing is active.
 func (w *World) Focus() *Task {
 	var best *Task
 	for _, t := range w.tasks {
@@ -292,38 +279,6 @@ func (w *World) LooseThreads(now time.Time) []Thread {
 	return threads
 }
 
-// Projects returns the known projects, ordered by most recent activity.
-func (w *World) Projects() []Project {
-	byName := make(map[string]*Project)
-	var order []string
-	for _, id := range w.order {
-		t := w.tasks[id]
-		name := t.Project
-		p, ok := byName[name]
-		if !ok {
-			p = &Project{Name: name}
-			byName[name] = p
-			order = append(order, name)
-		}
-		p.TaskCount++
-		if t.Status.IsOpen() {
-			p.OpenCount++
-		}
-		if t.LastEventAt.After(p.LastEventAt) {
-			p.LastEventAt = t.LastEventAt
-		}
-	}
-
-	out := make([]Project, 0, len(order))
-	for _, name := range order {
-		out = append(out, *byName[name])
-	}
-	sort.SliceStable(out, func(i, j int) bool {
-		return out[i].LastEventAt.After(out[j].LastEventAt)
-	})
-	return out
-}
-
 // Match returns tasks whose name contains query (case-insensitive), most
 // recently active first. An empty query returns all tasks in that order.
 func Match(tasks []Task, query string) []Task {
@@ -345,14 +300,4 @@ func addString(s []string, v string) []string {
 		return s
 	}
 	return append(s, v)
-}
-
-func removeString(s []string, v string) []string {
-	out := s[:0]
-	for _, x := range s {
-		if x != v {
-			out = append(out, x)
-		}
-	}
-	return out
 }

@@ -51,30 +51,35 @@ func allEvents(t *testing.T, store persistence.Store) []types.Event {
 	return events
 }
 
-func mustStart(t *testing.T, svc *service.Service, in service.StartInput) projection.Task {
+func mustLog(t *testing.T, svc *service.Service, in service.LogInput) projection.Task {
 	t.Helper()
-	task, err := svc.Start(context.Background(), in)
+	task, err := svc.Log(context.Background(), in)
 	if err != nil {
-		t.Fatalf("Start: %v", err)
+		t.Fatalf("Log(%s %s): %v", in.Action, in.Task, err)
 	}
 	return task
 }
 
-func TestStartCreatesTaskSetsActiveAndRecordsEvents(t *testing.T) {
+// start is the common case: a start action that creates and focuses a task.
+func start(t *testing.T, svc *service.Service, name string) projection.Task {
+	t.Helper()
+	return mustLog(t, svc, service.LogInput{Task: name, Action: types.ActionStart})
+}
+
+func TestStartCreatesTaskSetsActiveAndRecordsOneEvent(t *testing.T) {
 	svc, store := newTestService(t)
 
-	task := mustStart(t, svc, service.StartInput{Project: "DERS", Name: "OAuth"})
-	if task.Project != "DERS" || task.Name != "OAuth" {
-		t.Errorf("task project/name = %q/%q", task.Project, task.Name)
+	task := start(t, svc, "OAuth")
+	if task.Name != "OAuth" {
+		t.Errorf("task name = %q, want OAuth", task.Name)
 	}
 	if task.Status != projection.StatusActive {
 		t.Errorf("status = %q, want active", task.Status)
 	}
 
-	// task_created + focus_start.
-	events := allEvents(t, store)
-	if len(events) != 2 {
-		t.Fatalf("expected 2 events, got %d", len(events))
+	// A start creates the task implicitly — a single event, no separate create.
+	if events := allEvents(t, store); len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
 	}
 
 	focus, err := svc.Focus(context.Background())
@@ -86,206 +91,136 @@ func TestStartCreatesTaskSetsActiveAndRecordsEvents(t *testing.T) {
 	}
 }
 
-func TestStartRequiresProjectAndNameWhenCreating(t *testing.T) {
+func TestLogRequiresTaskAndValidAction(t *testing.T) {
 	svc, _ := newTestService(t)
-	if _, err := svc.Start(context.Background(), service.StartInput{Name: "x"}); err == nil {
-		t.Error("expected error when project missing")
+	ctx := context.Background()
+	if _, err := svc.Log(ctx, service.LogInput{Action: types.ActionStart}); err == nil {
+		t.Error("expected error when task reference is missing")
 	}
-	if _, err := svc.Start(context.Background(), service.StartInput{Project: "x"}); err == nil {
-		t.Error("expected error when name missing")
+	if _, err := svc.Log(ctx, service.LogInput{Task: "x", Action: "frobnicate"}); !errors.Is(err, service.ErrInvalidAction) {
+		t.Errorf("expected ErrInvalidAction, got %v", err)
+	}
+	if _, err := svc.Log(ctx, service.LogInput{Task: "x", Action: ""}); !errors.Is(err, service.ErrInvalidAction) {
+		t.Errorf("expected ErrInvalidAction for empty action, got %v", err)
 	}
 }
 
-func TestStartResumesExistingTask(t *testing.T) {
+func TestResumeReactivatesParkedTask(t *testing.T) {
 	svc, _ := newTestService(t)
-	ctx := context.Background()
 
-	task := mustStart(t, svc, service.StartInput{Project: "DERS", Name: "OAuth"})
-	if _, err := svc.Park(ctx, service.ParkInput{Reason: types.ParkPaused}); err != nil {
-		t.Fatalf("Park: %v", err)
-	}
+	task := start(t, svc, "OAuth")
+	mustLog(t, svc, service.LogInput{Task: task.ID, Action: types.ActionPark})
 
-	resumed := mustStart(t, svc, service.StartInput{TaskID: task.ID})
+	resumed := mustLog(t, svc, service.LogInput{Task: task.ID, Action: types.ActionResume})
 	if resumed.ID != task.ID || resumed.Status != projection.StatusActive {
 		t.Errorf("resume did not reactivate task: %+v", resumed)
 	}
 }
 
-func TestStartUnknownTaskErrors(t *testing.T) {
+func TestNonStartActionOnUnknownTaskErrors(t *testing.T) {
 	svc, _ := newTestService(t)
-	if _, err := svc.Start(context.Background(), service.StartInput{TaskID: "nope"}); !errors.Is(err, service.ErrTaskNotFound) {
+	ctx := context.Background()
+	// resume/note/etc. never create; only start does.
+	if _, err := svc.Log(ctx, service.LogInput{Task: "nope", Action: types.ActionResume}); !errors.Is(err, service.ErrTaskNotFound) {
 		t.Errorf("expected ErrTaskNotFound, got %v", err)
+	}
+	if _, err := svc.Log(ctx, service.LogInput{Task: "nope", Action: types.ActionNote, Message: "x"}); !errors.Is(err, service.ErrTaskNotFound) {
+		t.Errorf("expected ErrTaskNotFound for note, got %v", err)
 	}
 }
 
 func TestParkAndCompleteDeriveStatus(t *testing.T) {
 	svc, _ := newTestService(t)
-	ctx := context.Background()
 
-	task := mustStart(t, svc, service.StartInput{Project: "A", Name: "one"})
+	task := start(t, svc, "one")
 
-	parked, err := svc.Park(ctx, service.ParkInput{Reason: types.ParkInterrupted})
-	if err != nil {
-		t.Fatalf("Park: %v", err)
-	}
-	if parked.Status != projection.StatusParked || parked.ParkReason != types.ParkInterrupted {
-		t.Errorf("unexpected parked task: %+v", parked)
+	parked := mustLog(t, svc, service.LogInput{Task: task.ID, Action: types.ActionPark})
+	if parked.Status != projection.StatusParked {
+		t.Errorf("status = %q, want parked", parked.Status)
 	}
 
-	// After parking, nothing is in focus, so Complete needs an explicit id.
-	done, err := svc.Complete(ctx, service.CompleteInput{TaskID: task.ID, Summary: "shipped"})
-	if err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
+	done := mustLog(t, svc, service.LogInput{Task: task.ID, Action: types.ActionComplete, Message: "shipped"})
 	if done.Status != projection.StatusDone {
 		t.Errorf("status = %q, want done", done.Status)
 	}
 }
 
-func TestParkBlockedDerivesBlockedStatus(t *testing.T) {
+func TestBlockDerivesBlockedStatus(t *testing.T) {
 	svc, _ := newTestService(t)
-	ctx := context.Background()
 
-	mustStart(t, svc, service.StartInput{Project: "A", Name: "one"})
-	parked, err := svc.Park(ctx, service.ParkInput{Reason: types.ParkBlocked})
-	if err != nil {
-		t.Fatalf("Park: %v", err)
-	}
-	if parked.Status != projection.StatusBlocked {
-		t.Errorf("park reason blocked should derive blocked status, got %q", parked.Status)
-	}
-}
+	blocked := start(t, svc, "needs schema")
+	blocker := start(t, svc, "schema change")
 
-func TestResolveFallsBackToFocus(t *testing.T) {
-	svc, _ := newTestService(t)
-	ctx := context.Background()
-
-	mustStart(t, svc, service.StartInput{Project: "DERS", Name: "OAuth"})
-	e, err := svc.Note(ctx, service.NoteInput{Text: "investigated scopes"})
-	if err != nil {
-		t.Fatalf("Note: %v", err)
+	got := mustLog(t, svc, service.LogInput{Task: blocked.ID, Action: types.ActionBlock, Link: blocker.ID})
+	if got.Status != projection.StatusBlocked {
+		t.Errorf("block should derive blocked status, got %q", got.Status)
 	}
-	if e.Type != types.EventNote || e.Text != "investigated scopes" {
-		t.Errorf("unexpected note: %+v", e)
+	if len(got.BlockedBy) != 1 || got.BlockedBy[0] != blocker.ID {
+		t.Errorf("BlockedBy = %v, want [%s]", got.BlockedBy, blocker.ID)
 	}
 }
 
 func TestResolveByNameRecordsAgainstMatch(t *testing.T) {
 	svc, _ := newTestService(t)
-	ctx := context.Background()
 
-	target := mustStart(t, svc, service.StartInput{Project: "ADS", Name: "banana split"})
-	// Move focus elsewhere so resolution can't lean on it.
-	mustStart(t, svc, service.StartInput{Project: "ADS", Name: "unrelated"})
+	target := start(t, svc, "banana split")
+	start(t, svc, "unrelated") // move focus elsewhere
 
-	e, err := svc.Note(ctx, service.NoteInput{Query: "banana", Text: "peeled"})
-	if err != nil {
-		t.Fatalf("Note by name: %v", err)
-	}
-	if e.TaskID != target.ID {
-		t.Errorf("note recorded against %q, want %q", e.TaskID, target.ID)
-	}
-}
-
-func TestResolveByNameUnknownErrors(t *testing.T) {
-	svc, _ := newTestService(t)
-	ctx := context.Background()
-	mustStart(t, svc, service.StartInput{Project: "ADS", Name: "banana"})
-	if _, err := svc.Note(ctx, service.NoteInput{Query: "zebra", Text: "x"}); !errors.Is(err, service.ErrTaskNotFound) {
-		t.Errorf("expected ErrTaskNotFound, got %v", err)
+	got := mustLog(t, svc, service.LogInput{Task: "banana", Action: types.ActionNote, Message: "peeled"})
+	if got.ID != target.ID {
+		t.Errorf("note recorded against %q, want %q", got.ID, target.ID)
 	}
 }
 
 func TestResolveByNameAmbiguousErrors(t *testing.T) {
 	svc, _ := newTestService(t)
 	ctx := context.Background()
-	mustStart(t, svc, service.StartInput{Project: "ADS", Name: "monkey task"})
-	mustStart(t, svc, service.StartInput{Project: "ADS", Name: "monkey wrench"})
-	if _, err := svc.Note(ctx, service.NoteInput{Query: "monkey", Text: "x"}); !errors.Is(err, service.ErrAmbiguousTask) {
+	start(t, svc, "monkey task")
+	start(t, svc, "monkey wrench")
+	if _, err := svc.Log(ctx, service.LogInput{Task: "monkey", Action: types.ActionNote, Message: "x"}); !errors.Is(err, service.ErrAmbiguousTask) {
 		t.Errorf("expected ErrAmbiguousTask, got %v", err)
 	}
 }
 
 func TestResolveByNamePrefersSingleOpenTask(t *testing.T) {
 	svc, _ := newTestService(t)
-	ctx := context.Background()
-	done := mustStart(t, svc, service.StartInput{Project: "ADS", Name: "monkey task"})
-	open := mustStart(t, svc, service.StartInput{Project: "ADS", Name: "monkey wrench"})
-	if _, err := svc.Complete(ctx, service.CompleteInput{TaskID: done.ID}); err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
+
+	done := start(t, svc, "monkey task")
+	open := start(t, svc, "monkey wrench")
+	mustLog(t, svc, service.LogInput{Task: done.ID, Action: types.ActionComplete})
 
 	// "monkey" matches both, but only one is still open, so it resolves.
-	e, err := svc.Note(ctx, service.NoteInput{Query: "monkey", Text: "x"})
-	if err != nil {
-		t.Fatalf("Note: %v", err)
-	}
-	if e.TaskID != open.ID {
-		t.Errorf("note recorded against %q, want open task %q", e.TaskID, open.ID)
+	got := mustLog(t, svc, service.LogInput{Task: "monkey", Action: types.ActionNote, Message: "x"})
+	if got.ID != open.ID {
+		t.Errorf("note recorded against %q, want open task %q", got.ID, open.ID)
 	}
 }
 
-func TestExplicitTaskIDBeatsNameQuery(t *testing.T) {
+func TestExactIDResolvesOverFuzzyName(t *testing.T) {
 	svc, _ := newTestService(t)
-	ctx := context.Background()
-	byID := mustStart(t, svc, service.StartInput{Project: "ADS", Name: "monkey task"})
-	mustStart(t, svc, service.StartInput{Project: "ADS", Name: "banana task"})
+	byID := start(t, svc, "monkey task")
+	start(t, svc, "monkey wrench") // would be a fuzzy candidate
 
-	// task_id wins even when query would point elsewhere.
-	e, err := svc.Note(ctx, service.NoteInput{TaskID: byID.ID, Query: "banana", Text: "x"})
-	if err != nil {
-		t.Fatalf("Note: %v", err)
-	}
-	if e.TaskID != byID.ID {
-		t.Errorf("note recorded against %q, want %q", e.TaskID, byID.ID)
+	got := mustLog(t, svc, service.LogInput{Task: byID.ID, Action: types.ActionNote, Message: "x"})
+	if got.ID != byID.ID {
+		t.Errorf("note recorded against %q, want %q", got.ID, byID.ID)
 	}
 }
 
-func TestNoteAndCheckpointValidation(t *testing.T) {
+func TestStartLinkRecordsOrigin(t *testing.T) {
 	svc, _ := newTestService(t)
-	ctx := context.Background()
-	mustStart(t, svc, service.StartInput{Project: "A", Name: "one"})
 
-	if _, err := svc.Note(ctx, service.NoteInput{}); err == nil {
-		t.Error("expected error when note text missing")
-	}
-	if _, err := svc.Checkpoint(ctx, service.CheckpointInput{}); err == nil {
-		t.Error("expected error when checkpoint summary missing")
-	}
-}
+	// Start task A, then get pulled into B: park A, start B linked to A.
+	taskA := start(t, svc, "RPV query")
+	mustLog(t, svc, service.LogInput{Task: taskA.ID, Action: types.ActionPark})
+	taskB := mustLog(t, svc, service.LogInput{Task: "prod fire drill", Action: types.ActionStart, Link: taskA.ID})
 
-func TestOperationsWithoutFocusError(t *testing.T) {
-	svc, _ := newTestService(t)
-	ctx := context.Background()
-	if _, err := svc.Park(ctx, service.ParkInput{}); !errors.Is(err, service.ErrNoActiveFocus) {
-		t.Errorf("Park: expected ErrNoActiveFocus, got %v", err)
-	}
-	if _, err := svc.Complete(ctx, service.CompleteInput{}); !errors.Is(err, service.ErrNoActiveFocus) {
-		t.Errorf("Complete: expected ErrNoActiveFocus, got %v", err)
-	}
-}
-
-func TestInterruptionLineageAndLooseThreads(t *testing.T) {
-	svc, _ := newTestService(t)
-	ctx := context.Background()
-
-	// Start task A, then get pulled into B (interruption): park A, start B
-	// originating from A.
-	taskA := mustStart(t, svc, service.StartInput{Project: "ADS", Name: "RPV query"})
-	if _, err := svc.Park(ctx, service.ParkInput{Reason: types.ParkInterrupted, CauseTaskID: ""}); err != nil {
-		t.Fatalf("Park: %v", err)
-	}
-	taskB := mustStart(t, svc, service.StartInput{
-		Project: "ADS", Name: "prod fire drill",
-		FromTaskID: taskA.ID, OriginRel: types.RelInterrupts,
-	})
-
-	if taskB.OriginTaskID != taskA.ID || taskB.OriginRel != types.RelInterrupts {
-		t.Errorf("lineage not recorded on B: %+v", taskB)
+	if taskB.OriginTaskID != taskA.ID || taskB.OriginRel != types.RelOriginatedFrom {
+		t.Errorf("origin not recorded on B: %+v", taskB)
 	}
 
 	// A is now a loose thread; B is the focus and must be excluded.
-	threads, err := svc.LooseThreads(ctx)
+	threads, err := svc.LooseThreads(context.Background())
 	if err != nil {
 		t.Fatalf("LooseThreads: %v", err)
 	}
@@ -296,29 +231,16 @@ func TestInterruptionLineageAndLooseThreads(t *testing.T) {
 
 func TestBlockedThenUnblockedIsReadyToResume(t *testing.T) {
 	svc, _ := newTestService(t)
-	ctx := context.Background()
 
-	blocked := mustStart(t, svc, service.StartInput{Project: "P", Name: "needs schema"})
-	blocker := mustStart(t, svc, service.StartInput{Project: "P", Name: "schema change"})
+	blocked := start(t, svc, "needs schema")
+	blocker := start(t, svc, "schema change")
 
-	// schema change blocks needs-schema; park the blocked task.
-	if _, err := svc.Link(ctx, service.LinkInput{FromTaskID: blocker.ID, ToTaskID: blocked.ID, Rel: types.RelBlocks}); err != nil {
-		t.Fatalf("Link: %v", err)
-	}
-	if _, err := svc.Park(ctx, service.ParkInput{TaskID: blocked.ID, Reason: types.ParkBlocked}); err != nil {
-		t.Fatalf("Park: %v", err)
-	}
+	// schema change blocks needs-schema.
+	mustLog(t, svc, service.LogInput{Task: blocked.ID, Action: types.ActionBlock, Link: blocker.ID})
+	// Completing the blocker clears the block.
+	mustLog(t, svc, service.LogInput{Task: blocker.ID, Action: types.ActionComplete})
 
-	// Resolve the blocker.
-	if _, err := svc.Link(ctx, service.LinkInput{FromTaskID: blocker.ID, ToTaskID: blocked.ID, Rel: types.RelBlocks, Resolved: true}); err != nil {
-		t.Fatalf("resolve Link: %v", err)
-	}
-	// Complete the blocker so it isn't itself a loose thread.
-	if _, err := svc.Complete(ctx, service.CompleteInput{TaskID: blocker.ID}); err != nil {
-		t.Fatalf("Complete blocker: %v", err)
-	}
-
-	threads, err := svc.LooseThreads(ctx)
+	threads, err := svc.LooseThreads(context.Background())
 	if err != nil {
 		t.Fatalf("LooseThreads: %v", err)
 	}
@@ -326,17 +248,18 @@ func TestBlockedThenUnblockedIsReadyToResume(t *testing.T) {
 		t.Fatalf("expected the unblocked task as the loose thread, got %+v", threads)
 	}
 	if !threads[0].ReadyToResume {
-		t.Error("expected ready_to_resume after blocker resolved")
+		t.Error("expected ready_to_resume after blocker completed")
 	}
 }
 
-func TestListTasksAndProjects(t *testing.T) {
+func TestListTasksByNameAndStatus(t *testing.T) {
 	svc, _ := newTestService(t)
 	ctx := context.Background()
 
-	mustStart(t, svc, service.StartInput{Project: "ADS", Name: "monkey task"})
-	mustStart(t, svc, service.StartInput{Project: "ADS", Name: "banana task"})
-	mustStart(t, svc, service.StartInput{Project: "OTHER", Name: "monkey wrench"})
+	start(t, svc, "monkey task")
+	start(t, svc, "banana task")
+	wrench := start(t, svc, "monkey wrench")
+	mustLog(t, svc, service.LogInput{Task: wrench.ID, Action: types.ActionComplete})
 
 	matches, err := svc.ListTasks(ctx, service.ListTasksInput{Query: "monkey"})
 	if err != nil {
@@ -346,20 +269,12 @@ func TestListTasksAndProjects(t *testing.T) {
 		t.Errorf("expected 2 monkey matches, got %d", len(matches))
 	}
 
-	scoped, err := svc.ListTasks(ctx, service.ListTasksInput{Query: "monkey", Project: "ADS"})
+	open, err := svc.ListTasks(ctx, service.ListTasksInput{Query: "monkey", Status: projection.StatusActive})
 	if err != nil {
 		t.Fatalf("ListTasks scoped: %v", err)
 	}
-	if len(scoped) != 1 || scoped[0].Project != "ADS" {
-		t.Errorf("project scope failed: %+v", scoped)
-	}
-
-	projects, err := svc.Projects(ctx)
-	if err != nil {
-		t.Fatalf("Projects: %v", err)
-	}
-	if len(projects) != 2 {
-		t.Errorf("expected 2 projects, got %d", len(projects))
+	if len(open) != 1 || open[0].Name != "monkey task" {
+		t.Errorf("status scope failed: %+v", open)
 	}
 }
 
@@ -367,68 +282,69 @@ func TestContextReturnsLatestCheckpoint(t *testing.T) {
 	svc, _ := newTestService(t)
 	ctx := context.Background()
 
-	mustStart(t, svc, service.StartInput{Project: "DERS", Name: "OAuth"})
-	if _, err := svc.Checkpoint(ctx, service.CheckpointInput{Summary: "first"}); err != nil {
-		t.Fatalf("Checkpoint: %v", err)
-	}
-	if _, err := svc.Note(ctx, service.NoteInput{Text: "a later note"}); err != nil {
-		t.Fatalf("Note: %v", err)
-	}
-	if _, err := svc.Checkpoint(ctx, service.CheckpointInput{Summary: "second", NextAction: "ship it"}); err != nil {
-		t.Fatalf("Checkpoint: %v", err)
-	}
+	task := start(t, svc, "OAuth")
+	mustLog(t, svc, service.LogInput{Task: task.ID, Action: types.ActionCheckpoint, Message: "first"})
+	mustLog(t, svc, service.LogInput{Task: task.ID, Action: types.ActionNote, Message: "a later note"})
+	mustLog(t, svc, service.LogInput{Task: task.ID, Action: types.ActionCheckpoint, Message: "second", NextAction: "ship it"})
 
 	c, err := svc.Context(ctx, "", "")
 	if err != nil {
 		t.Fatalf("Context: %v", err)
 	}
-	if c.LatestCheckpoint == nil || c.LatestCheckpoint.Summary != "second" {
+	if c.LatestCheckpoint == nil || c.LatestCheckpoint.Message != "second" {
 		t.Errorf("expected latest checkpoint 'second', got %+v", c.LatestCheckpoint)
+	}
+}
+
+func TestContextWithoutFocusErrors(t *testing.T) {
+	svc, _ := newTestService(t)
+	if _, err := svc.Context(context.Background(), "", ""); !errors.Is(err, service.ErrNoActiveFocus) {
+		t.Errorf("expected ErrNoActiveFocus, got %v", err)
 	}
 }
 
 func TestRecentNewestFirstWithDefaultLimit(t *testing.T) {
 	svc, _ := newTestService(t)
-	ctx := context.Background()
 
-	mustStart(t, svc, service.StartInput{Project: "DERS", Name: "OAuth"})
+	task := start(t, svc, "OAuth")
 	for i := range 12 {
-		if _, err := svc.Note(ctx, service.NoteInput{Text: fmt.Sprintf("note %02d", i)}); err != nil {
-			t.Fatalf("Note: %v", err)
-		}
+		mustLog(t, svc, service.LogInput{Task: task.ID, Action: types.ActionNote, Message: fmt.Sprintf("note %02d", i)})
 	}
 
-	got, err := svc.Recent(ctx, service.RecentInput{})
+	got, err := svc.Recent(context.Background(), service.RecentInput{})
 	if err != nil {
 		t.Fatalf("Recent: %v", err)
 	}
 	if len(got) != service.DefaultRecentLimit {
 		t.Fatalf("got %d events, want default %d", len(got), service.DefaultRecentLimit)
 	}
-	if got[0].Text != "note 11" {
-		t.Errorf("first event = %q, want %q (newest first)", got[0].Text, "note 11")
+	if got[0].Message != "note 11" {
+		t.Errorf("first event = %q, want %q (newest first)", got[0].Message, "note 11")
 	}
 }
 
-func TestSearchByProjectAndType(t *testing.T) {
+func TestSearchByActionAndText(t *testing.T) {
 	svc, _ := newTestService(t)
 	ctx := context.Background()
 
-	mustStart(t, svc, service.StartInput{Project: "DERS", Name: "OAuth"})
-	if _, err := svc.Checkpoint(ctx, service.CheckpointInput{Summary: "keep me"}); err != nil {
-		t.Fatalf("Checkpoint: %v", err)
-	}
-	mustStart(t, svc, service.StartInput{Project: "OTHER", Name: "x"})
-	if _, err := svc.Checkpoint(ctx, service.CheckpointInput{Summary: "elsewhere"}); err != nil {
-		t.Fatalf("Checkpoint: %v", err)
-	}
+	task := start(t, svc, "OAuth")
+	mustLog(t, svc, service.LogInput{Task: task.ID, Action: types.ActionCheckpoint, Message: "keep me"})
+	mustLog(t, svc, service.LogInput{Task: task.ID, Action: types.ActionNote, Message: "discard"})
 
-	got, err := svc.Search(ctx, service.SearchInput{Project: "DERS", Type: types.EventCheckpoint})
+	got, err := svc.Search(ctx, service.SearchInput{Action: types.ActionCheckpoint})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
-	if len(got) != 1 || got[0].Summary != "keep me" {
-		t.Errorf("expected only the DERS checkpoint, got %+v", got)
+	if len(got) != 1 || got[0].Message != "keep me" {
+		t.Errorf("expected only the checkpoint, got %+v", got)
+	}
+
+	byText, err := svc.Search(ctx, service.SearchInput{Text: "keep"})
+	if err != nil {
+		t.Fatalf("Search text: %v", err)
+	}
+	if len(byText) != 1 || byText[0].Message != "keep me" {
+		t.Errorf("text search = %+v", byText)
 	}
 }
 
@@ -449,17 +365,17 @@ func (failingStore) ListEvents(context.Context, types.EventFilter) ([]types.Even
 	return nil, errors.New("read failed")
 }
 
-func TestCheckpointPropagatesStoreError(t *testing.T) {
-	// ListEvents fails first (during focus resolution), so any error suffices.
+func TestLogPropagatesStoreError(t *testing.T) {
+	// ListEvents fails first (during resolution), so any error suffices.
 	svc := service.New(failingStore{appendErr: true})
-	if _, err := svc.Checkpoint(context.Background(), service.CheckpointInput{TaskID: "t", Summary: "s"}); err == nil {
+	if _, err := svc.Log(context.Background(), service.LogInput{Task: "t", Action: types.ActionStart}); err == nil {
 		t.Error("expected store error to propagate")
 	}
 }
 
-func TestProjectsPropagatesStoreError(t *testing.T) {
+func TestRecentPropagatesStoreError(t *testing.T) {
 	svc := service.New(failingStore{})
-	if _, err := svc.Projects(context.Background()); err == nil {
+	if _, err := svc.Recent(context.Background(), service.RecentInput{}); err == nil {
 		t.Error("expected store error to propagate")
 	}
 }

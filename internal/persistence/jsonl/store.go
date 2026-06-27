@@ -137,13 +137,8 @@ func matchesFilter(event types.Event, filter types.EventFilter) bool {
 	if filter.TaskID != "" && event.TaskID != filter.TaskID {
 		return false
 	}
-	if len(filter.Types) > 0 && !slices.Contains(filter.Types, event.Type) {
+	if len(filter.Actions) > 0 && !slices.Contains(filter.Actions, event.Action) {
 		return false
-	}
-	for _, tag := range filter.Tags {
-		if !slices.Contains(event.Tags, tag) {
-			return false
-		}
 	}
 	if filter.Since != nil && event.Timestamp.Before(*filter.Since) {
 		return false
@@ -159,10 +154,7 @@ func matchesFilter(event types.Event, filter types.EventFilter) bool {
 
 func matchesText(event types.Event, text string) bool {
 	needle := strings.ToLower(text)
-	fields := []string{event.Name, event.Project, event.Summary, event.Text, event.NextAction}
-	fields = append(fields, event.OpenQuestions...)
-	fields = append(fields, event.Tags...)
-	for _, field := range fields {
+	for _, field := range []string{event.Name, event.Message, event.NextAction} {
 		if strings.Contains(strings.ToLower(field), needle) {
 			return true
 		}

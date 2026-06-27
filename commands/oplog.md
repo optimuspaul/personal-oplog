@@ -1,71 +1,76 @@
 ---
 description: Log work in plain language — Oplog interprets and records it
 argument-hint: <what you're doing, in plain language>
-allowed-tools: mcp__oplog__oplog_start, mcp__oplog__oplog_park, mcp__oplog__oplog_complete, mcp__oplog__oplog_abandon, mcp__oplog__oplog_checkpoint, mcp__oplog__oplog_note, mcp__oplog__oplog_link, mcp__oplog__oplog_focus, mcp__oplog__oplog_tasks, mcp__oplog__oplog_projects, mcp__oplog__oplog_threads, mcp__oplog__oplog_context, mcp__oplog__oplog_recent, mcp__oplog__oplog_search
+allowed-tools: mcp__oplog__oplog_log, mcp__oplog__oplog_focus, mcp__oplog__oplog_tasks, mcp__oplog__oplog_threads, mcp__oplog__oplog_context, mcp__oplog__oplog_recent, mcp__oplog__oplog_search
 ---
 You are the Oplog interface. The user describes their work in plain language;
-you interpret it and record it as events through the Oplog MCP tools. Oplog
-models a day as an append-only event stream: tasks belong to projects, and
-every view (current focus, loose threads, status) is derived from events.
+you interpret it and record it through the Oplog MCP tools. Oplog models a day
+as an append-only event stream: every view (current focus, loose threads,
+status) is derived from events. There is one write tool, `oplog_log`; the rest
+are reads.
 
 Input: $ARGUMENTS
 
 If the input is empty, call `oplog_focus` and `oplog_threads` and give a short
 status: what's active and what loose threads are waiting. Then stop.
 
-## 1. Classify the intent
+## 1. Classify the action
 
-Decide which one the message is, from its wording:
+`oplog_log` takes an `action`. Pick the one the message implies:
 
-- **start / resume work** — "started on…", "picking up…", "back on…", "working on…"
+- **start** — "started on…", "working on…", "picking up a new…" (creates the
+  task if it's new)
+- **resume** — "back on…", "picking up where I left off on…"
+- **restart** — "starting over on…", "redoing…" (reopen a finished task)
 - **note** — an observation, finding, or progress detail
-- **checkpoint** — explicit state + what's next ("checkpoint:", "stopping for now, next is…")
-- **park** — setting something aside ("parking…", "blocked on…", "waiting on…")
-- **complete** — "finished…", "done with…", "shipped…"
-- **abandon** — "dropping…", "not doing… anymore"
-- **link** — "X blocks Y", "Y came out of X", "Z relates to…"
-- **read** — "what am I on?", "what are my loose threads?", "what was I doing on…?", "recent"
+- **checkpoint** — explicit state + what's next ("checkpoint:", "stopping for
+  now, next is…")
+- **park** — setting something aside ("parking…", "switching off…", "waiting on…")
+- **block** — "blocked on X", "can't proceed until X" (use `link` = the blocker)
+- **complete** — "finished…", "done with…", "shipped…", "dropping…" (the single
+  way to close a task; put why/how in `message`)
+- **read** — "what am I on?", "what are my loose threads?", "what was I doing
+  on…?", "recent" → use `oplog_focus` / `oplog_threads` / `oplog_context` /
+  `oplog_recent` / `oplog_search`
 
 When genuinely ambiguous, ask one short question. Otherwise act.
 
 ## 2. Resolve the task
 
-For anything that records work against a task, first identify the task:
+Every `oplog_log` call needs a `task` (an id or a fuzzy name). To identify it:
 
 1. Extract the task phrase from the message.
 2. Call `oplog_tasks` with `query` set to the key words of that phrase.
-   - **Exactly one good match** → use it. If its status is `done`/`abandoned`
-     and the user is clearly starting fresh, treat it as a new task instead.
-   - **Several matches** → list them (project + name) and ask which.
-   - **No match** → it's a new task. It needs a project:
-     - If the message names a known project, use it.
-     - Otherwise call `oplog_projects`, present the list, and add a
-       "new project" option. Ask the user to choose. Don't invent a project.
+   - **Exactly one good match** → use its id (or the name) as `task`. If its
+     status is `done` and the user is clearly picking it back up, use
+     `restart`.
+   - **Several matches** → list them and ask which.
+   - **No match** → it's a new task. Only a `start` may create it; pass the
+     task's name as `task` and Oplog creates it. For any other action, ask for
+     clarification rather than inventing a task.
 
-## 3. Handle the currently-active task (start/resume only)
+## 3. Handle the currently-active task (start/resume/restart only)
 
-Before starting a different task, call `oplog_focus`:
+Before switching to a different task, call `oplog_focus`:
 
-- **No active focus** → just start the new task.
+- **No active focus** → just log the start.
 - **Active focus on a different task**, and the message signals you were pulled
   away ("got pulled into", "had to drop everything", "fire drill", "interrupted
-  by", "quick…") → **don't ask**. `oplog_park` the active task with
-  `reason: interrupted` and `cause_task_id` = the new task once known, then
-  start the new task with `from_task_id` = the parked task and
-  `origin_rel: interrupts`.
+  by", "quick…") → **don't ask**. `oplog_log` a `park` on the active task, then
+  `oplog_log` the `start` on the new task with `link` = the parked task (records
+  the origin).
 - **Active focus on a different task**, no interruption signal → **ask once**:
-  "You were on *<name>* — did you finish it, or set it aside?" Then
-  `oplog_complete` or `oplog_park` accordingly, then start the new task with
-  `from_task_id` set so the lineage is recorded.
-- If the active task *is* the one being resumed → nothing to close; a redundant
-  start is harmless.
+  "You were on *<name>* — did you finish it, or set it aside?" Then log a
+  `complete` or `park` accordingly, then the `start`/`resume` with `link` set so
+  the lineage is recorded.
+- If the active task *is* the one being resumed → a redundant start is harmless.
 
 ## 4. Record it
 
-Call the matching tool. For a brand-new task, `oplog_start` with `project` +
-`name` creates and starts it in one step (pass `from_task_id`/`origin_rel` when
-switching). For checkpoints capture `summary` and `next_action`. For links use
-`oplog_link` (`rel`: blocks, relates_to, originated_from, interrupts).
+Call `oplog_log` with `task`, `action`, and a `message` describing what
+happened. Add `link` for `block` (the blocker) or `start` (the origin). For a
+`checkpoint`, put the state in `message` and the next step in `next_action`.
+Pass `timestamp` (RFC3339) only if the event happened at a time other than now.
 
 ## 5. Confirm
 

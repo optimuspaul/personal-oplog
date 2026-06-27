@@ -11,14 +11,12 @@ import (
 // taskOutput is the structured view of a derived task.
 type taskOutput struct {
 	ID           string   `json:"id"`
-	Project      string   `json:"project,omitempty"`
 	Name         string   `json:"name,omitempty"`
 	Status       string   `json:"status"`
 	CreatedAt    string   `json:"created_at,omitempty"`
 	LastEventAt  string   `json:"last_event_at,omitempty"`
 	OriginTaskID string   `json:"origin_task_id,omitempty"`
 	OriginRel    string   `json:"origin_rel,omitempty"`
-	ParkReason   string   `json:"park_reason,omitempty"`
 	BlockedBy    []string `json:"blocked_by,omitempty"`
 	Blocks       []string `json:"blocks,omitempty"`
 }
@@ -26,14 +24,12 @@ type taskOutput struct {
 func newTaskOutput(t projection.Task) taskOutput {
 	return taskOutput{
 		ID:           t.ID,
-		Project:      t.Project,
 		Name:         t.Name,
 		Status:       string(t.Status),
 		CreatedAt:    formatTime(t.CreatedAt),
 		LastEventAt:  formatTime(t.LastEventAt),
 		OriginTaskID: t.OriginTaskID,
 		OriginRel:    string(t.OriginRel),
-		ParkReason:   string(t.ParkReason),
 		BlockedBy:    t.BlockedBy,
 		Blocks:       t.Blocks,
 	}
@@ -94,78 +90,30 @@ func newThreadsOutput(threads []projection.Thread) threadsOutput {
 	return out
 }
 
-// projectOutput is the structured view of a project.
-type projectOutput struct {
-	Name        string `json:"name"`
-	TaskCount   int    `json:"task_count"`
-	OpenCount   int    `json:"open_count"`
-	LastEventAt string `json:"last_event_at,omitempty"`
-}
-
-type projectsOutput struct {
-	Count    int             `json:"count"`
-	Projects []projectOutput `json:"projects"`
-}
-
-func newProjectsOutput(projects []projection.Project) projectsOutput {
-	out := projectsOutput{Count: len(projects), Projects: make([]projectOutput, 0, len(projects))}
-	for _, p := range projects {
-		out.Projects = append(out.Projects, projectOutput{
-			Name:        p.Name,
-			TaskCount:   p.TaskCount,
-			OpenCount:   p.OpenCount,
-			LastEventAt: formatTime(p.LastEventAt),
-		})
-	}
-	return out
-}
-
 // eventOutput mirrors a stored event with stable JSON field names.
 type eventOutput struct {
-	ID           string   `json:"id"`
-	Timestamp    string   `json:"timestamp"`
-	Type         string   `json:"type"`
-	TaskID       string   `json:"task_id,omitempty"`
-	Project      string   `json:"project,omitempty"`
-	Name         string   `json:"name,omitempty"`
-	OriginTaskID string   `json:"origin_task_id,omitempty"`
-	OriginRel    string   `json:"origin_rel,omitempty"`
-	FromTaskID   string   `json:"from_task_id,omitempty"`
-	Reason       string   `json:"reason,omitempty"`
-	CauseTaskID  string   `json:"cause_task_id,omitempty"`
-	Summary      string   `json:"summary,omitempty"`
-	Text         string   `json:"text,omitempty"`
-	NextAction   string   `json:"next_action,omitempty"`
-	OpenQuestion []string `json:"open_questions,omitempty"`
-	Files        []string `json:"files,omitempty"`
-	Tags         []string `json:"tags,omitempty"`
-	ToTaskID     string   `json:"to_task_id,omitempty"`
-	Rel          string   `json:"rel,omitempty"`
-	Resolved     bool     `json:"resolved,omitempty"`
+	ID         string `json:"id"`
+	Timestamp  string `json:"timestamp"`
+	Action     string `json:"action"`
+	TaskID     string `json:"task_id,omitempty"`
+	Name       string `json:"name,omitempty"`
+	Message    string `json:"message,omitempty"`
+	NextAction string `json:"next_action,omitempty"`
+	LinkTaskID string `json:"link_task_id,omitempty"`
+	Rel        string `json:"rel,omitempty"`
 }
 
 func newEventOutput(e types.Event) eventOutput {
 	return eventOutput{
-		ID:           e.ID,
-		Timestamp:    formatTime(e.Timestamp),
-		Type:         string(e.Type),
-		TaskID:       e.TaskID,
-		Project:      e.Project,
-		Name:         e.Name,
-		OriginTaskID: e.OriginTaskID,
-		OriginRel:    string(e.OriginRel),
-		FromTaskID:   e.FromTaskID,
-		Reason:       string(e.Reason),
-		CauseTaskID:  e.CauseTaskID,
-		Summary:      e.Summary,
-		Text:         e.Text,
-		NextAction:   e.NextAction,
-		OpenQuestion: e.OpenQuestions,
-		Files:        e.Files,
-		Tags:         e.Tags,
-		ToTaskID:     e.ToTaskID,
-		Rel:          string(e.Rel),
-		Resolved:     e.Resolved,
+		ID:         e.ID,
+		Timestamp:  formatTime(e.Timestamp),
+		Action:     string(e.Action),
+		TaskID:     e.TaskID,
+		Name:       e.Name,
+		Message:    e.Message,
+		NextAction: e.NextAction,
+		LinkTaskID: e.LinkTaskID,
+		Rel:        string(e.Rel),
 	}
 }
 

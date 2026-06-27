@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/optimuspaul/personal-oplog/internal/persistence/types"
 	"github.com/optimuspaul/personal-oplog/internal/projection"
@@ -14,12 +15,15 @@ import (
 // focus when none is set.
 var ErrNoActiveFocus = errors.New("no active focus")
 
-// ErrTaskNotFound is returned when an operation references an unknown task ID.
+// ErrTaskNotFound is returned when an operation references an unknown task.
 var ErrTaskNotFound = errors.New("task not found")
 
 // ErrAmbiguousTask is returned when a name query matches more than one task and
 // can't be narrowed to a single open one.
 var ErrAmbiguousTask = errors.New("ambiguous task")
+
+// ErrInvalidAction is returned when a log action is empty or unrecognized.
+var ErrInvalidAction = errors.New("invalid action")
 
 func errFieldRequired(field string) error {
 	return fmt.Errorf("%s is required", field)
@@ -34,29 +38,27 @@ func (s *Service) world(ctx context.Context) (*projection.World, error) {
 	return projection.Build(events), nil
 }
 
-// resolveTaskID picks the task an operation acts on, in priority order:
-//  1. an explicit task ID (validated against the log);
-//  2. a fuzzy name query, resolved to a single task;
-//  3. the current focus, when neither is given.
-func (s *Service) resolveTaskID(ctx context.Context, taskID, query string) (string, error) {
+// resolveExisting picks an existing task from a reference that is either a task
+// ID or a fuzzy name. It does not create tasks.
+func (s *Service) resolveExisting(ctx context.Context, ref string) (string, error) {
 	w, err := s.world(ctx)
 	if err != nil {
 		return "", err
 	}
-	if taskID != "" {
-		if w.Task(taskID) == nil {
-			return "", fmt.Errorf("%w: %s", ErrTaskNotFound, taskID)
-		}
-		return taskID, nil
+	return resolveRef(w, ref)
+}
+
+// resolveRef turns a task reference (ID or fuzzy name) into a single task ID
+// against an already-built world.
+func resolveRef(w *projection.World, ref string) (string, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "", errFieldRequired("task")
 	}
-	if q := strings.TrimSpace(query); q != "" {
-		return resolveByName(w, q)
+	if w.Task(ref) != nil {
+		return ref, nil
 	}
-	focus := w.Focus()
-	if focus == nil {
-		return "", ErrNoActiveFocus
-	}
-	return focus.ID, nil
+	return resolveByName(w, ref)
 }
 
 // resolveByName turns a fuzzy name query into a single task ID. A lone match
@@ -92,7 +94,7 @@ func resolveByName(w *projection.World, query string) (string, error) {
 func describeCandidates(tasks []projection.Task) string {
 	parts := make([]string, 0, len(tasks))
 	for _, t := range tasks {
-		parts = append(parts, fmt.Sprintf("%s (%s/%s, %s)", t.ID, t.Project, t.Name, t.Status))
+		parts = append(parts, fmt.Sprintf("%s (%s, %s)", t.ID, t.Name, t.Status))
 	}
 	return strings.Join(parts, "; ")
 }
@@ -114,255 +116,74 @@ func (s *Service) appendAndProject(ctx context.Context, taskID string, e types.E
 	return *t, nil
 }
 
-// CreateTaskInput introduces a new task. Origin links it to the task it was
-// spawned from, when OriginRel is set.
-type CreateTaskInput struct {
-	Project   string
-	Name      string
-	OriginID  string
-	OriginRel types.Relationship
+// LogInput records a single journal event — the only write operation. Task is a
+// reference (ID or fuzzy name); an unmatched name creates a task, but only for a
+// start action. Link optionally points at a related task; its relationship is
+// inferred from Action. Timestamp defaults to now.
+type LogInput struct {
+	Task       string
+	Action     types.Action
+	Message    string
+	Link       string
+	NextAction string
+	Timestamp  *time.Time
 }
 
-// CreateTask records a task_created event and returns the new task. It does
-// not change focus — pair it with Start to begin work.
-func (s *Service) CreateTask(ctx context.Context, in CreateTaskInput) (projection.Task, error) {
-	if in.Project == "" {
-		return projection.Task{}, fmt.Errorf("create task: %w", errFieldRequired("project"))
+// Log appends one event and returns the task's resulting derived view. It
+// resolves (or, for start, creates) the referenced task, resolves any link, and
+// records the relationship the action implies.
+func (s *Service) Log(ctx context.Context, in LogInput) (projection.Task, error) {
+	if !in.Action.IsValid() {
+		return projection.Task{}, fmt.Errorf("log: %w: %q", ErrInvalidAction, in.Action)
 	}
-	if in.Name == "" {
-		return projection.Task{}, fmt.Errorf("create task: %w", errFieldRequired("name"))
+	ref := strings.TrimSpace(in.Task)
+	if ref == "" {
+		return projection.Task{}, fmt.Errorf("log: %w", errFieldRequired("task"))
 	}
 
-	taskID := s.newID()
-	e := types.Event{
-		ID:        s.newID(),
-		Timestamp: s.now(),
-		Type:      types.EventTaskCreated,
-		TaskID:    taskID,
-		Project:   in.Project,
-		Name:      in.Name,
+	w, err := s.world(ctx)
+	if err != nil {
+		return projection.Task{}, fmt.Errorf("log: %w", err)
 	}
-	if in.OriginRel != "" && in.OriginID != "" {
-		e.OriginTaskID = in.OriginID
-		e.OriginRel = in.OriginRel
-	}
-	return s.appendAndProject(ctx, taskID, e)
-}
 
-// StartInput begins or resumes focus on a task. Provide TaskID to resume an
-// existing task, or Project+Name to create one and start it in a single step.
-// FromTaskID records the task focus moved away from; with OriginRel set it
-// also records why the new task exists (spawned from / interrupting it).
-type StartInput struct {
-	TaskID     string
-	Project    string
-	Name       string
-	FromTaskID string
-	OriginRel  types.Relationship
-}
-
-// Start records a focus_start, creating the task first when only Project+Name
-// are given. It returns the now-active task.
-func (s *Service) Start(ctx context.Context, in StartInput) (projection.Task, error) {
-	taskID := in.TaskID
-	if taskID == "" {
-		created, err := s.CreateTask(ctx, CreateTaskInput{
-			Project:   in.Project,
-			Name:      in.Name,
-			OriginID:  in.FromTaskID,
-			OriginRel: in.OriginRel,
-		})
-		if err != nil {
-			return projection.Task{}, fmt.Errorf("start: %w", err)
+	// Resolve the task; a start may create one when nothing matches.
+	taskID, err := resolveRef(w, ref)
+	name := ""
+	if err != nil {
+		if in.Action == types.ActionStart && errors.Is(err, ErrTaskNotFound) {
+			taskID = s.newID()
+			name = ref
+		} else {
+			return projection.Task{}, fmt.Errorf("log: %w", err)
 		}
-		taskID = created.ID
-	} else if _, err := s.resolveTaskID(ctx, taskID, ""); err != nil {
-		return projection.Task{}, fmt.Errorf("start: %w", err)
+	}
+
+	// Resolve an optional link to an existing task.
+	var linkID string
+	if l := strings.TrimSpace(in.Link); l != "" {
+		linkID, err = resolveRef(w, l)
+		if err != nil {
+			return projection.Task{}, fmt.Errorf("log: link: %w", err)
+		}
+	}
+
+	ts := s.now()
+	if in.Timestamp != nil {
+		ts = *in.Timestamp
 	}
 
 	e := types.Event{
 		ID:         s.newID(),
-		Timestamp:  s.now(),
-		Type:       types.EventFocusStart,
+		Timestamp:  ts,
+		Action:     in.Action,
 		TaskID:     taskID,
-		FromTaskID: in.FromTaskID,
+		Name:       name,
+		Message:    in.Message,
+		NextAction: in.NextAction,
+	}
+	if linkID != "" {
+		e.LinkTaskID = linkID
+		e.Rel = types.RelForAction(in.Action)
 	}
 	return s.appendAndProject(ctx, taskID, e)
-}
-
-// ParkInput sets a task aside. TaskID defaults to the current focus. Reason
-// defaults to "paused". CauseTaskID records what pulled attention away.
-type ParkInput struct {
-	TaskID      string
-	Query       string
-	Reason      types.ParkReason
-	CauseTaskID string
-}
-
-// Park records a park event for the resolved task.
-func (s *Service) Park(ctx context.Context, in ParkInput) (projection.Task, error) {
-	taskID, err := s.resolveTaskID(ctx, in.TaskID, in.Query)
-	if err != nil {
-		return projection.Task{}, fmt.Errorf("park: %w", err)
-	}
-	reason := in.Reason
-	if reason == "" {
-		reason = types.ParkPaused
-	}
-	e := types.Event{
-		ID:          s.newID(),
-		Timestamp:   s.now(),
-		Type:        types.EventPark,
-		TaskID:      taskID,
-		Reason:      reason,
-		CauseTaskID: in.CauseTaskID,
-	}
-	return s.appendAndProject(ctx, taskID, e)
-}
-
-// CompleteInput marks a task done. TaskID defaults to the current focus.
-type CompleteInput struct {
-	TaskID  string
-	Query   string
-	Summary string
-}
-
-// Complete records a complete event for the resolved task.
-func (s *Service) Complete(ctx context.Context, in CompleteInput) (projection.Task, error) {
-	taskID, err := s.resolveTaskID(ctx, in.TaskID, in.Query)
-	if err != nil {
-		return projection.Task{}, fmt.Errorf("complete: %w", err)
-	}
-	e := types.Event{
-		ID:        s.newID(),
-		Timestamp: s.now(),
-		Type:      types.EventComplete,
-		TaskID:    taskID,
-		Summary:   in.Summary,
-	}
-	return s.appendAndProject(ctx, taskID, e)
-}
-
-// AbandonInput drops a task. TaskID defaults to the current focus.
-type AbandonInput struct {
-	TaskID string
-	Query  string
-	Reason string
-}
-
-// Abandon records an abandon event for the resolved task.
-func (s *Service) Abandon(ctx context.Context, in AbandonInput) (projection.Task, error) {
-	taskID, err := s.resolveTaskID(ctx, in.TaskID, in.Query)
-	if err != nil {
-		return projection.Task{}, fmt.Errorf("abandon: %w", err)
-	}
-	e := types.Event{
-		ID:        s.newID(),
-		Timestamp: s.now(),
-		Type:      types.EventAbandon,
-		TaskID:    taskID,
-		Summary:   in.Reason,
-	}
-	return s.appendAndProject(ctx, taskID, e)
-}
-
-// CheckpointInput captures resumable context. TaskID defaults to the focus.
-type CheckpointInput struct {
-	TaskID        string
-	Query         string
-	Summary       string
-	NextAction    string
-	OpenQuestions []string
-	Files         []string
-	Tags          []string
-}
-
-// Checkpoint records a checkpoint event and returns it.
-func (s *Service) Checkpoint(ctx context.Context, in CheckpointInput) (types.Event, error) {
-	if in.Summary == "" {
-		return types.Event{}, fmt.Errorf("checkpoint: %w", errFieldRequired("summary"))
-	}
-	taskID, err := s.resolveTaskID(ctx, in.TaskID, in.Query)
-	if err != nil {
-		return types.Event{}, fmt.Errorf("checkpoint: %w", err)
-	}
-	e := types.Event{
-		ID:            s.newID(),
-		Timestamp:     s.now(),
-		Type:          types.EventCheckpoint,
-		TaskID:        taskID,
-		Summary:       in.Summary,
-		NextAction:    in.NextAction,
-		OpenQuestions: in.OpenQuestions,
-		Files:         in.Files,
-		Tags:          in.Tags,
-	}
-	if err := s.store.AppendEvent(ctx, e); err != nil {
-		return types.Event{}, fmt.Errorf("checkpoint: %w", err)
-	}
-	return e, nil
-}
-
-// NoteInput records a free-form note. TaskID defaults to the focus.
-type NoteInput struct {
-	TaskID string
-	Query  string
-	Text   string
-	Tags   []string
-	Files  []string
-}
-
-// Note records a note event and returns it.
-func (s *Service) Note(ctx context.Context, in NoteInput) (types.Event, error) {
-	if in.Text == "" {
-		return types.Event{}, fmt.Errorf("note: %w", errFieldRequired("text"))
-	}
-	taskID, err := s.resolveTaskID(ctx, in.TaskID, in.Query)
-	if err != nil {
-		return types.Event{}, fmt.Errorf("note: %w", err)
-	}
-	e := types.Event{
-		ID:        s.newID(),
-		Timestamp: s.now(),
-		Type:      types.EventNote,
-		TaskID:    taskID,
-		Text:      in.Text,
-		Tags:      in.Tags,
-		Files:     in.Files,
-	}
-	if err := s.store.AppendEvent(ctx, e); err != nil {
-		return types.Event{}, fmt.Errorf("note: %w", err)
-	}
-	return e, nil
-}
-
-// LinkInput records a task→task edge. Resolved clears a prior blocks edge.
-type LinkInput struct {
-	FromTaskID string
-	ToTaskID   string
-	Rel        types.Relationship
-	Resolved   bool
-}
-
-// Link records a link event and returns it.
-func (s *Service) Link(ctx context.Context, in LinkInput) (types.Event, error) {
-	if in.FromTaskID == "" || in.ToTaskID == "" {
-		return types.Event{}, fmt.Errorf("link: %w", errFieldRequired("from_task_id and to_task_id"))
-	}
-	if in.Rel == "" {
-		return types.Event{}, fmt.Errorf("link: %w", errFieldRequired("rel"))
-	}
-	e := types.Event{
-		ID:        s.newID(),
-		Timestamp: s.now(),
-		Type:      types.EventLink,
-		TaskID:    in.FromTaskID,
-		ToTaskID:  in.ToTaskID,
-		Rel:       in.Rel,
-		Resolved:  in.Resolved,
-	}
-	if err := s.store.AppendEvent(ctx, e); err != nil {
-		return types.Event{}, fmt.Errorf("link: %w", err)
-	}
-	return e, nil
 }

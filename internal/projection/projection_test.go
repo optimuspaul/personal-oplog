@@ -25,30 +25,34 @@ func (b *builder) add(e types.Event) *builder {
 	return b
 }
 
-func (b *builder) created(id, project, name string) *builder {
-	return b.add(types.Event{Type: types.EventTaskCreated, TaskID: id, Project: project, Name: name})
+func (b *builder) ev(action types.Action, id, name, link string) *builder {
+	e := types.Event{Action: action, TaskID: id, Name: name}
+	if link != "" {
+		e.LinkTaskID = link
+		e.Rel = types.RelForAction(action)
+	}
+	return b.add(e)
 }
-func (b *builder) start(id string) *builder {
-	return b.add(types.Event{Type: types.EventFocusStart, TaskID: id})
-}
-func (b *builder) park(id string, reason types.ParkReason) *builder {
-	return b.add(types.Event{Type: types.EventPark, TaskID: id, Reason: reason})
-}
-func (b *builder) complete(id string) *builder {
-	return b.add(types.Event{Type: types.EventComplete, TaskID: id})
-}
-func (b *builder) link(from, to string, rel types.Relationship, resolved bool) *builder {
-	return b.add(types.Event{Type: types.EventLink, TaskID: from, ToTaskID: to, Rel: rel, Resolved: resolved})
+
+func (b *builder) start(id, name string) *builder { return b.ev(types.ActionStart, id, name, "") }
+func (b *builder) note(id, name string) *builder  { return b.ev(types.ActionNote, id, name, "") }
+func (b *builder) park(id string) *builder        { return b.ev(types.ActionPark, id, "", "") }
+func (b *builder) complete(id string) *builder    { return b.ev(types.ActionComplete, id, "", "") }
+
+// block records that id is blocked by blocker.
+func (b *builder) block(id, blocker string) *builder {
+	return b.ev(types.ActionBlock, id, "", blocker)
 }
 
 func (b *builder) build() *projection.World { return projection.Build(b.events) }
 
 func TestStatusTransitions(t *testing.T) {
 	w := (&builder{}).
-		created("a", "P", "alpha").                                        // new
-		created("b", "P", "beta").start("b").                              // active
-		created("c", "P", "gamma").start("c").park("c", types.ParkPaused). // parked
-		created("d", "P", "delta").start("d").complete("d").               // done
+		note("a", "alpha").                // new: referenced, never started
+		start("b", "beta").                // active
+		start("c", "gamma").park("c").     // parked
+		start("d", "delta").complete("d"). // done
+		start("e", "eps").block("e", "b"). // blocked (by active b)
 		build()
 
 	want := map[string]projection.TaskStatus{
@@ -56,6 +60,7 @@ func TestStatusTransitions(t *testing.T) {
 		"b": projection.StatusActive,
 		"c": projection.StatusParked,
 		"d": projection.StatusDone,
+		"e": projection.StatusBlocked,
 	}
 	for _, tk := range w.Tasks() {
 		if want[tk.ID] != tk.Status {
@@ -66,8 +71,8 @@ func TestStatusTransitions(t *testing.T) {
 
 func TestFocusIsMostRecentActive(t *testing.T) {
 	w := (&builder{}).
-		created("a", "P", "alpha").start("a").
-		created("b", "P", "beta").start("b").
+		start("a", "alpha").
+		start("b", "beta").
 		build()
 
 	focus := w.Focus()
@@ -78,19 +83,19 @@ func TestFocusIsMostRecentActive(t *testing.T) {
 
 func TestFocusNilWhenAllClosed(t *testing.T) {
 	w := (&builder{}).
-		created("a", "P", "alpha").start("a").park("a", types.ParkPaused).
+		start("a", "alpha").park("a").
 		build()
 	if f := w.Focus(); f != nil {
 		t.Errorf("expected no focus, got %+v", f)
 	}
 }
 
-func TestBlockedOverlayAndResolution(t *testing.T) {
-	// b blocks a; a should read blocked even though it was only parked.
+func TestBlockedAndResolutionByBlockerCompletion(t *testing.T) {
+	// a is blocked by b; a reads blocked.
 	w := (&builder{}).
-		created("a", "P", "alpha").start("a").park("a", types.ParkWaiting).
-		created("b", "P", "beta").
-		link("b", "a", types.RelBlocks, false).
+		start("a", "alpha").park("a").
+		start("b", "beta").
+		block("a", "b").
 		build()
 
 	a := w.Task("a")
@@ -101,28 +106,29 @@ func TestBlockedOverlayAndResolution(t *testing.T) {
 		t.Errorf("a.BlockedBy = %v, want [b]", a.BlockedBy)
 	}
 
-	// Resolve the block: a is no longer blocked.
+	// Completing the blocker clears the block; a is no longer blocked.
 	w2 := (&builder{}).
-		created("a", "P", "alpha").start("a").park("a", types.ParkWaiting).
-		created("b", "P", "beta").
-		link("b", "a", types.RelBlocks, false).
-		link("b", "a", types.RelBlocks, true).
+		start("a", "alpha").park("a").
+		start("b", "beta").
+		block("a", "b").
+		complete("b").
 		build()
-	if w2.Task("a").Status == projection.StatusBlocked {
-		t.Error("a should not be blocked after the edge is resolved")
+	if got := w2.Task("a"); got.Status == projection.StatusBlocked {
+		t.Errorf("a should not be blocked after blocker completes, got %q", got.Status)
 	}
 }
 
 func TestLooseThreadsRankReadyFirstThenStalest(t *testing.T) {
 	// a: parked long ago, never blocked.
-	// b: was blocked, now resolved (ready to resume), parked recently.
+	// b: was blocked, blocker since completed (ready to resume).
 	// c: the current focus, must be excluded.
 	w := (&builder{}).
-		created("a", "P", "alpha").start("a").park("a", types.ParkPaused).
-		created("b", "P", "beta").start("b").park("b", types.ParkBlocked).
-		created("x", "P", "blocker").link("x", "b", types.RelBlocks, false).
-		link("x", "b", types.RelBlocks, true).complete("x").
-		created("c", "P", "gamma").start("c").
+		start("a", "alpha").park("a").
+		start("b", "beta").
+		start("x", "blocker").
+		block("b", "x").
+		complete("x").
+		start("c", "gamma").
 		build()
 
 	now := base.Add(48 * time.Hour)
@@ -140,31 +146,11 @@ func TestLooseThreadsRankReadyFirstThenStalest(t *testing.T) {
 	}
 }
 
-func TestProjectsCountOpenAndTotal(t *testing.T) {
-	w := (&builder{}).
-		created("a", "ADS", "alpha").start("a").
-		created("b", "ADS", "beta").start("b").complete("b").
-		created("c", "OTHER", "gamma").
-		build()
-
-	projects := w.Projects()
-	got := map[string]projection.Project{}
-	for _, p := range projects {
-		got[p.Name] = p
-	}
-	if got["ADS"].TaskCount != 2 || got["ADS"].OpenCount != 1 {
-		t.Errorf("ADS = %+v, want 2 tasks / 1 open", got["ADS"])
-	}
-	if got["OTHER"].TaskCount != 1 || got["OTHER"].OpenCount != 1 {
-		t.Errorf("OTHER = %+v, want 1 task / 1 open", got["OTHER"])
-	}
-}
-
 func TestMatchByNameRecencyOrdered(t *testing.T) {
 	w := (&builder{}).
-		created("a", "P", "monkey task").start("a").
-		created("b", "P", "monkey wrench").start("b").
-		created("c", "P", "banana").
+		start("a", "monkey task").
+		start("b", "monkey wrench").
+		note("c", "banana").
 		build()
 
 	matches := projection.Match(w.Tasks(), "monkey")

@@ -15,7 +15,9 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/optimuspaul/personal-oplog/internal/mcp"
+	"github.com/optimuspaul/personal-oplog/internal/persistence"
 	"github.com/optimuspaul/personal-oplog/internal/persistence/jsonl"
+	"github.com/optimuspaul/personal-oplog/internal/persistence/sqlite"
 	"github.com/optimuspaul/personal-oplog/internal/service"
 )
 
@@ -30,9 +32,19 @@ func main() {
 
 func run() error {
 	dir := flag.String("dir", defaultDir(), "directory for the Oplog data store")
+	backend := flag.String("backend", "jsonl", "persistence backend: sqlite or jsonl")
 	flag.Parse()
 
-	store, err := jsonl.NewStore(*dir)
+	var store persistence.Store
+	var err error
+	switch *backend {
+	case "sqlite":
+		store, err = sqlite.NewSqliteStore(*dir)
+	case "jsonl":
+		store, err = jsonl.NewStore(*dir)
+	default:
+		return fmt.Errorf("unknown backend %q: want sqlite or jsonl", *backend)
+	}
 	if err != nil {
 		return fmt.Errorf("open store at %q: %w", *dir, err)
 	}

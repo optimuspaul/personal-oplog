@@ -6,16 +6,14 @@ import "time"
 // impose no constraint, so an empty filter matches every event.
 //
 // The store deliberately filters only on fields every event can carry. Higher
-// level concerns — "events for a project" or "tasks matching a name" — are
-// resolved in the projection layer, which knows how events roll up into tasks.
+// level concerns — "tasks matching a name" — are resolved in the projection
+// layer, which knows how events roll up into tasks.
 type EventFilter struct {
 	// TaskID, when set, limits results to events concerning this task.
 	TaskID string
 
-	// Types, when non-empty, limits results to events of these types.
-	Types []EventType
-	// Tags, when non-empty, limits results to events carrying all of these tags.
-	Tags []string
+	// Actions, when non-empty, limits results to events of these actions.
+	Actions []Action
 
 	// Text, when set, limits results to events whose textual fields match,
 	// case-insensitively.
