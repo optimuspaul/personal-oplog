@@ -54,7 +54,7 @@ func registerTools(server *mcpsdk.Server, svc *service.Service) {
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        "oplog_graph",
-		Description: "Render the work journal as a git-graph diagram: each task is a branch, each event a commit, and a task that originated from another forks off its parent's branch. Omit task to graph the whole journal, or pass a task (ULID or fuzzy name) to scope to that task's lineage (everything linked to it via originated-from/block edges). format is 'mermaid' (gitGraph source text, the default) or 'svg' (a self-contained SVG image).",
+		Description: "Render the work journal as a git-graph diagram: each task is a branch, each event a commit, and a task that originated from another forks off its parent's branch. Omit task to graph the whole journal, or pass a task (ULID or fuzzy name) to scope to that task's lineage (everything linked to it via originated-from/block edges). Narrow to a date window with since/until (inclusive bounds — a YYYY-MM-DD date, RFC3339 timestamp, or today/yesterday; a lone date scopes to that single day) or with range for a natural-language window like 'today', 'yesterday', 'this week', 'last week', 'last 2 days', or 'last month'. format is 'mermaid' (gitGraph source text, the default) or 'svg' (a self-contained SVG image).",
 	}, graphHandler(svc))
 }
 
@@ -213,6 +213,9 @@ func searchHandler(svc *service.Service) mcpsdk.ToolHandlerFor[searchInput, even
 type graphInput struct {
 	Task   string `json:"task,omitempty" jsonschema:"ULID id or fuzzy name to scope the diagram to one task's lineage; omitted graphs the whole journal"`
 	Format string `json:"format,omitempty" jsonschema:"output format: mermaid (gitGraph source, default) or svg (a self-contained image)"`
+	Since  string `json:"since,omitempty" jsonschema:"inclusive start of a date window: a calendar date (YYYY-MM-DD), an RFC3339 timestamp, or today/yesterday; a lone date here scopes to that single day"`
+	Until  string `json:"until,omitempty" jsonschema:"inclusive end of a date window: a calendar date (YYYY-MM-DD), an RFC3339 timestamp, or today/yesterday"`
+	Range  string `json:"range,omitempty" jsonschema:"natural-language date window, used only when since/until are omitted: a single date, today, yesterday, this week, last week, last 2 days, last 3 weeks, last month"`
 }
 
 func graphHandler(svc *service.Service) mcpsdk.ToolHandlerFor[graphInput, graphOutput] {
@@ -220,6 +223,9 @@ func graphHandler(svc *service.Service) mcpsdk.ToolHandlerFor[graphInput, graphO
 		res, err := svc.Graph(ctx, service.GraphInput{
 			Task:   in.Task,
 			Format: service.GraphFormat(strings.ToLower(strings.TrimSpace(in.Format))),
+			Since:  in.Since,
+			Until:  in.Until,
+			Range:  in.Range,
 		})
 		if err != nil {
 			return nil, graphOutput{}, err

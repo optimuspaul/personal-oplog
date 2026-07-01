@@ -23,9 +23,20 @@ const (
 // scopes the diagram to that task's lineage — every task reachable from it
 // through originated-from and block links, in either direction — instead of the
 // whole journal. Format defaults to Mermaid.
+//
+// Since, Until, and Range optionally narrow the diagram to a date window
+// (inclusive on both ends). Since/Until are explicit bounds — a calendar date
+// (2006-01-02), an RFC3339 timestamp, or "today"/"yesterday"; a lone Since or
+// Until naming a bare date collapses to that single day. Range is a
+// natural-language span ("last week", "last 2 days", "yesterday", "this week")
+// resolved against the service clock, and is used only when neither Since nor
+// Until is set.
 type GraphInput struct {
 	Task   string
 	Format GraphFormat
+	Since  string
+	Until  string
+	Range  string
 }
 
 // GraphResult carries both renderings plus the scope that produced them so the
@@ -58,6 +69,18 @@ func (s *Service) Graph(ctx context.Context, in GraphInput) (GraphResult, error)
 		scoped = true
 	}
 
+	// Resolve the date window after lineage scoping so task-name resolution and
+	// link-following still see the whole history, then keep only the events that
+	// fall inside the window.
+	window, err := parseWindow(in.Since, in.Until, in.Range, s.now())
+	if err != nil {
+		return GraphResult{}, fmt.Errorf("graph: %w", err)
+	}
+	if !window.empty() {
+		events = filterByWindow(events, window)
+		scoped = true
+	}
+
 	g := render.BuildGraph(events)
 	format := in.Format
 	if format == "" {
@@ -74,6 +97,22 @@ func (s *Service) Graph(ctx context.Context, in GraphInput) (GraphResult, error)
 		out.SVG = render.SVG(g, render.SVGOptions{})
 	}
 	return out, nil
+}
+
+// filterByWindow keeps only the events whose timestamps fall within w
+// (inclusive on both bounds).
+func filterByWindow(events []types.Event, w timeWindow) []types.Event {
+	out := events[:0:0]
+	for _, e := range events {
+		if w.Since != nil && e.Timestamp.Before(*w.Since) {
+			continue
+		}
+		if w.Until != nil && e.Timestamp.After(*w.Until) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // scopeToLineage keeps only the events whose tasks are reachable from seedID
