@@ -51,6 +51,11 @@ func registerTools(server *mcpsdk.Server, svc *service.Service) {
 		Name:        "oplog_search",
 		Description: "Search events by task, text, or action. Returns most recent first.",
 	}, searchHandler(svc))
+
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:        "oplog_graph",
+		Description: "Render the work journal as a git-graph diagram: each task is a branch, each event a commit, and a task that originated from another forks off its parent's branch. Omit task to graph the whole journal, or pass a task (ULID or fuzzy name) to scope to that task's lineage (everything linked to it via originated-from/block edges). format is 'mermaid' (gitGraph source text, the default) or 'svg' (a self-contained SVG image).",
+	}, graphHandler(svc))
 }
 
 // --- log ---
@@ -200,6 +205,33 @@ func searchHandler(svc *service.Service) mcpsdk.ToolHandlerFor[searchInput, even
 		}
 		out := newEventsOutput(events)
 		return textResult(fmt.Sprintf("Found %d matching %s.", out.Count, plural(out.Count, "event", "events"))), out, nil
+	}
+}
+
+// --- graph ---
+
+type graphInput struct {
+	Task   string `json:"task,omitempty" jsonschema:"ULID id or fuzzy name to scope the diagram to one task's lineage; omitted graphs the whole journal"`
+	Format string `json:"format,omitempty" jsonschema:"output format: mermaid (gitGraph source, default) or svg (a self-contained image)"`
+}
+
+func graphHandler(svc *service.Service) mcpsdk.ToolHandlerFor[graphInput, graphOutput] {
+	return func(ctx context.Context, _ *mcpsdk.CallToolRequest, in graphInput) (*mcpsdk.CallToolResult, graphOutput, error) {
+		res, err := svc.Graph(ctx, service.GraphInput{
+			Task:   in.Task,
+			Format: service.GraphFormat(strings.ToLower(strings.TrimSpace(in.Format))),
+		})
+		if err != nil {
+			return nil, graphOutput{}, err
+		}
+		out := newGraphOutput(res)
+		// Hand back the rendered diagram itself as the text content so a client
+		// can drop it straight into a markdown fence or an <svg> sink.
+		body := res.Mermaid
+		if res.Format == service.FormatSVG {
+			body = res.SVG
+		}
+		return textResult(body), out, nil
 	}
 }
 

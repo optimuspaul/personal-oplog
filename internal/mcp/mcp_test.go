@@ -101,6 +101,7 @@ func TestListToolsExposesFullSurface(t *testing.T) {
 		"oplog_log": false, "oplog_focus": false, "oplog_tasks": false,
 		"oplog_threads": false, "oplog_context": false,
 		"oplog_recent": false, "oplog_search": false,
+		"oplog_graph": false,
 	}
 	for _, tool := range res.Tools {
 		if _, ok := want[tool.Name]; ok {

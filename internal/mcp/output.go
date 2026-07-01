@@ -6,6 +6,7 @@ import (
 
 	"github.com/optimuspaul/personal-oplog/internal/persistence/types"
 	"github.com/optimuspaul/personal-oplog/internal/projection"
+	"github.com/optimuspaul/personal-oplog/internal/service"
 )
 
 // taskOutput is the structured view of a derived task.
@@ -148,6 +149,27 @@ func newContextOutput(c projection.Context) contextOutput {
 		out.RecentEvents = append(out.RecentEvents, newEventOutput(e))
 	}
 	return out
+}
+
+// graphOutput is the structured result of a journal git-graph render. Mermaid
+// always carries the gitGraph source; SVG is populated only when that format was
+// requested.
+type graphOutput struct {
+	Format    string `json:"format"`
+	Mermaid   string `json:"mermaid"`
+	SVG       string `json:"svg,omitempty"`
+	TaskCount int    `json:"task_count"`
+	Scoped    bool   `json:"scoped"`
+}
+
+func newGraphOutput(r service.GraphResult) graphOutput {
+	return graphOutput{
+		Format:    string(r.Format),
+		Mermaid:   r.Mermaid,
+		SVG:       r.SVG,
+		TaskCount: r.TaskCount,
+		Scoped:    r.Scoped,
+	}
 }
 
 func formatTime(t time.Time) string {

@@ -198,6 +198,24 @@ or was subsumed lives in the `message`, not in a separate status.
 | `oplog_context`   | Reconstruct a task: latest checkpoint + recent events.            |
 | `oplog_recent`    | The most recent N events (optionally one action).                 |
 | `oplog_search`    | Search events by task, text, or action.                          |
+| `oplog_graph`     | Render the journal as a git-graph (Mermaid text or SVG image).    |
+
+`oplog_graph` draws the journal the way a day actually unfolds: each task is a
+branch/lane, each event a commit, and a task that originated from another forks
+off its parent at the point in time it began. Omit `task` to graph everything,
+or pass one (id or fuzzy name) to scope to that task's lineage — every task
+linked to it through originated-from/block edges. `format` is:
+
+- `mermaid` (default) — gitGraph source text that renders anywhere Mermaid does;
+  `complete` shows as a highlighted commit, `block` as a reverse commit tagged
+  with the blocker.
+- `svg` — a self-contained, GitKraken-style image: one row per event, a left
+  gutter of task names, colored lane rails with bezier branch-offs, node dots
+  for ordinary events and tag chips for lifecycle events (✓ checkpoint/complete,
+  ‖ parked, ⊘ blocked), and a highlight band on the current focus row. Each
+  event's message is shown in full in a right-hand column, wrapped across as
+  many lines as it needs (rows grow to fit — nothing is truncated). Colour
+  encodes *which task*, not status.
 
 > Tool names use underscores rather than dots (`oplog_log`, not `oplog.log`):
 > the Anthropic API restricts tool names to `[a-zA-Z0-9_-]`.
